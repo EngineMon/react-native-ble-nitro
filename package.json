@@ -1,7 +1,7 @@
 {
   "name": "react-native-ble-nitro",
-  "version": "1.15.1",
-  "description": "High-performance React Native BLE library built on Nitro Modules",
+  "version": "2.0.0",
+  "description": "React Native BLE central library on Nitro Modules: operation queues, typed errors, flow-controlled writes and a C++ API",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "react-native": "src/index.ts",

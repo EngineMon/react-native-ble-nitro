@@ -1,38 +1,60 @@
-import BleNitroNativeFactory, { NativeBleNitro } from './specs/NativeBleNitroFactory';
+import BleNitroNativeFactory from './specs/NativeBleNitroFactory';
 import {
-  ScanFilter as NativeScanFilter,
-  BLEDevice as NativeBLEDevice,
-  BLEState as NativeBLEState,
-  ScanCallback as NativeScanCallback,
-  AndroidScanMode as NativeAndroidScanMode,
   AndroidConnectionPriority as NativeAndroidConnectionPriority,
-} from './specs/NativeBleNitro';
+  AndroidScanMode as NativeAndroidScanMode,
+  BleErrorCode,
+  BLEState as NativeBLEState,
+  type BLEDevice as NativeBLEDevice,
+  type BleError as NativeBleError,
+  type ConnectOptions as NativeConnectOptions,
+  type NativeBleNitro,
+  type OperationCallback as NativeOperationCallback,
+  type ScanFilter as NativeScanFilter,
+} from './specs/NativeBleNitro.nitro';
 
-export class BleTimeoutError extends Error {
-  constructor(operation: string, ms: number) {
-    super(`${operation} timed out after ${ms}ms`);
-    this.name = 'BleTimeoutError';
+export { BleErrorCode, type NativeBleNitro };
+
+/**
+ * The error every promise of this library rejects with, and every
+ * synchronous method throws.
+ */
+export class BleError extends Error {
+  /** What went wrong. The numbers equal react-native-ble-plx's BleErrorCode. */
+  readonly errorCode: BleErrorCode;
+  /**
+   * The platform's own status when it gave one: Android GATT/HCI status or
+   * scan error code, iOS CBError/CBATTError code.
+   */
+  readonly nativeStatus?: number;
+  /** The device the failed operation was for, if any. */
+  readonly deviceId?: string;
+  /** The exception this error was converted from, if any. */
+  readonly cause?: unknown;
+
+  constructor(
+    errorCode: BleErrorCode,
+    message: string,
+    details: { nativeStatus?: number; deviceId?: string; cause?: unknown } = {}
+  ) {
+    super(message);
+    this.name = 'BleError';
+    this.errorCode = errorCode;
+    this.nativeStatus = details.nativeStatus;
+    this.deviceId = details.deviceId;
+    this.cause = details.cause;
   }
-}
-
-function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  operation: string
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new BleTimeoutError(operation, ms)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 export type ByteArray = number[];
 
 export interface ScanFilter {
+  /** Only report devices advertising one of these services. Absent: all devices. */
   serviceUUIDs?: string[];
+  /** Drop results weaker than this (dBm). Absent: no RSSI filter. */
   rssiThreshold?: number;
+  /** Report every advertisement of a device, not only its first one. Default false. */
   allowDuplicates?: boolean;
+  /** Android only. Default Balanced. */
   androidScanMode?: AndroidScanMode;
 }
 
@@ -65,23 +87,44 @@ export interface BLEDevice {
   isConnected: boolean;
 }
 
+export interface ConnectOptions {
+  /** Android: BluetoothDevice.connectGatt's autoConnect. Default false. */
+  autoConnectAndroid?: boolean;
+  /**
+   * Android: clear the OS GATT cache (BluetoothGatt.refresh) right after the
+   * link comes up, before any other operation. Default false.
+   */
+  refreshGattAndroid?: boolean;
+  /**
+   * Fail the connect with OperationTimedOut and cancel the pending link when
+   * it isn't up after this long. Absent: the OS decides (Android about 30 s,
+   * iOS never).
+   */
+  timeoutMs?: number;
+}
+
+export interface FindAndConnectOptions extends ConnectOptions {
+  /** How long to scan for the device before failing with DeviceNotFound. Default 5000 ms. */
+  scanTimeout?: number;
+  onDisconnect?: DisconnectEventCallback;
+  /** Called with the scan result once the device was found, as the connect starts. */
+  onFound?: (device: BLEDevice) => void;
+}
+
 export type ScanCallback = (device: BLEDevice) => void;
+export type ScanErrorCallback = (error: BleError) => void;
 export type RestoreStateCallback = (connectedPeripherals: BLEDevice[]) => void;
-export type ConnectionCallback = (
-  success: boolean,
-  deviceId: string,
-  error: string
-) => void;
+export type StateChangeCallback = (state: BLEState) => void;
+/**
+ * `interrupted` is false when the link went down because of disconnect() or
+ * destroy(), true when the device or the OS dropped it.
+ */
 export type DisconnectEventCallback = (
   deviceId: string,
   interrupted: boolean,
-  error: string
+  error?: BleError
 ) => void;
-export type OperationCallback = (success: boolean, error: string) => void;
-export type CharacteristicUpdateCallback = (
-  characteristicId: string,
-  data: ByteArray
-) => void;
+export type CharacteristicUpdateCallback = (data: ArrayBuffer) => void;
 
 export type Subscription = {
   remove: () => void;
@@ -89,7 +132,7 @@ export type Subscription = {
 
 export type AsyncSubscription = {
   remove: () => Promise<void>;
-}
+};
 
 export enum BLEState {
   Unknown = 'Unknown',
@@ -98,7 +141,7 @@ export enum BLEState {
   Unauthorized = 'Unauthorized',
   PoweredOff = 'PoweredOff',
   PoweredOn = 'PoweredOn',
-};
+}
 
 export enum AndroidScanMode {
   LowLatency = 'LowLatency',
@@ -114,90 +157,134 @@ export enum AndroidConnectionPriority {
 }
 
 export type BleNitroManagerOptions = {
+  /**
+   * iOS: CoreBluetooth state-restoration key. Absent: no state restoration.
+   * Keep it stable across releases; iOS restores by this key.
+   */
   restoreIdentifier?: string;
   onRestoredState?: RestoreStateCallback;
 };
 
-export function mapNativeBLEStateToBLEState(nativeState: NativeBLEState): BLEState {
-  const map = {
-    0: BLEState.Unknown,
-    1: BLEState.Resetting,
-    2: BLEState.Unsupported,
-    3: BLEState.Unauthorized,
-    4: BLEState.PoweredOff,
-    5: BLEState.PoweredOn,
-  };
-  return map[nativeState];
+const FIND_AND_CONNECT_SCAN_TIMEOUT_MS = 5000;
+
+const BLE_STATE_FROM_NATIVE: Record<NativeBLEState, BLEState> = {
+  [NativeBLEState.Unknown]: BLEState.Unknown,
+  [NativeBLEState.Resetting]: BLEState.Resetting,
+  [NativeBLEState.Unsupported]: BLEState.Unsupported,
+  [NativeBLEState.Unauthorized]: BLEState.Unauthorized,
+  [NativeBLEState.PoweredOff]: BLEState.PoweredOff,
+  [NativeBLEState.PoweredOn]: BLEState.PoweredOn,
+};
+
+const SCAN_MODE_TO_NATIVE: Record<AndroidScanMode, NativeAndroidScanMode> = {
+  [AndroidScanMode.LowLatency]: NativeAndroidScanMode.LowLatency,
+  [AndroidScanMode.Balanced]: NativeAndroidScanMode.Balanced,
+  [AndroidScanMode.LowPower]: NativeAndroidScanMode.LowPower,
+  [AndroidScanMode.Opportunistic]: NativeAndroidScanMode.Opportunistic,
+};
+
+const CONNECTION_PRIORITY_TO_NATIVE: Record<AndroidConnectionPriority, NativeAndroidConnectionPriority> = {
+  [AndroidConnectionPriority.Balanced]: NativeAndroidConnectionPriority.Balanced,
+  [AndroidConnectionPriority.High]: NativeAndroidConnectionPriority.High,
+  [AndroidConnectionPriority.LowPower]: NativeAndroidConnectionPriority.LowPower,
+};
+
+function bleErrorFromNative(error: NativeBleError, deviceId: string | undefined): BleError {
+  return new BleError(error.code, error.message, { nativeStatus: error.nativeStatus, deviceId });
 }
 
-export function mapAndroidScanModeToNativeAndroidScanMode(scanMode: AndroidScanMode): NativeAndroidScanMode {
-  const map = {
-    LowLatency: NativeAndroidScanMode.LowLatency,
-    Balanced: NativeAndroidScanMode.Balanced,
-    LowPower: NativeAndroidScanMode.LowPower,
-    Opportunistic: NativeAndroidScanMode.Opportunistic,
-  }
-  return map[scanMode];
+/** Wraps an exception a native call threw (a bug or an OS exception) into a BleError. */
+function bleErrorFromThrown(thrown: unknown, deviceId: string | undefined): BleError {
+  if (thrown instanceof BleError) return thrown;
+  const message = thrown instanceof Error ? thrown.message : String(thrown);
+  return new BleError(BleErrorCode.UnknownError, message, { deviceId, cause: thrown });
 }
 
-export function mapAndroidConnectionPriorityToNativeAndroidConnectionPriority(priority: AndroidConnectionPriority): NativeAndroidConnectionPriority {
-  const map = {
-    Balanced: NativeAndroidConnectionPriority.Balanced,
-    High: NativeAndroidConnectionPriority.High,
-    LowPower: NativeAndroidConnectionPriority.LowPower,
-  }
-  return map[priority];
-}
-
-export function convertNativeBleDeviceToBleDevice(nativeBleDevice: NativeBLEDevice): BLEDevice {
+function toBleDevice(device: NativeBLEDevice): BLEDevice {
   return {
-    ...nativeBleDevice,
-    serviceUUIDs: BleNitroManager.normalizeGattUUIDs(nativeBleDevice.serviceUUIDs),
+    id: device.id,
+    name: device.name,
+    rssi: device.rssi,
+    isConnectable: device.isConnectable,
+    isConnected: device.isConnected,
+    serviceUUIDs: BleNitroManager.normalizeGattUUIDs(device.serviceUUIDs),
     manufacturerData: {
-      companyIdentifiers: nativeBleDevice.manufacturerData.companyIdentifiers.map(entry => ({
+      companyIdentifiers: device.manufacturerData.companyIdentifiers.map((entry) => ({
         id: entry.id,
-        data: arrayBufferToByteArray(entry.data)
-      }))
+        data: Array.from(new Uint8Array(entry.data)),
+      })),
     },
     serviceData: {
-      services: nativeBleDevice.serviceData.services.map(entry => ({
+      services: device.serviceData.services.map((entry) => ({
         uuid: BleNitroManager.normalizeGattUUID(entry.uuid),
-        data: arrayBufferToByteArray(entry.data)
-      }))
-    }
-  }
+        data: Array.from(new Uint8Array(entry.data)),
+      })),
+    },
+  };
 }
 
-export function arrayBufferToByteArray(buffer: ArrayBuffer): ByteArray {
-  return Array.from(new Uint8Array(buffer));
-}
+type StateListener = { callback: StateChangeCallback };
 
-export function byteArrayToArrayBuffer(data: ByteArray): ArrayBuffer {
-  return new Uint8Array(data).buffer;
-}
+/** Identity of one startScan call; results of a stopped or replaced scan are dropped. */
+type ScanSession = object;
 
+/**
+ * One subscribeToCharacteristic call. The native side keeps one subscription
+ * per characteristic, so a newer subscription (or an unsubscribe) deactivates
+ * this one: it gets no more values and its remove() leaves the newer one alone.
+ */
+type NotificationSubscription = { active: boolean };
+
+/**
+ * Promise API over the native manager (see NativeBleNitro.nitro.ts for the
+ * native contract).
+ *
+ * - Every promise settles exactly once and rejects with a BleError; every
+ *   synchronous method throws BleError.
+ * - Operations on one device run one at a time, in call order, natively.
+ *   Every queued GATT operation fails with OperationTimedOut after 30 s.
+ * - When a link drops, every pending operation of it fails with
+ *   DeviceDisconnected; destroy() fails them with BluetoothManagerDestroyed.
+ * - Callbacks run on the JS thread, in the order the OS delivered the events.
+ * - After destroy(), every method throws or rejects with
+ *   BluetoothManagerDestroyed, except the ones that only release something
+ *   (stopScan, Subscription.remove, AsyncSubscription.remove, destroy), which
+ *   do nothing.
+ */
 export class BleNitroManager {
-  private _isScanning: boolean = false;
+  private readonly _native: NativeBleNitro;
+  private _destroyed = false;
 
   private _restoredStateCallback: RestoreStateCallback | null;
   private _restoredState: BLEDevice[] | null = null;
-  private _restoreStateIdentifier: string | null = null;
 
-  private Instance: NativeBleNitro;
+  private _scanSession: ScanSession | null = null;
+  private readonly _stateListeners = new Set<StateListener>();
+  /** Keyed by device, service and characteristic; the newest subscription per characteristic. */
+  private readonly _notificationSubscriptions = new Map<string, NotificationSubscription>();
 
   constructor(options?: BleNitroManagerOptions) {
     this._restoredStateCallback = options?.onRestoredState ?? null;
-    this._restoreStateIdentifier = options?.restoreIdentifier ?? null;
-    this.Instance = BleNitroNativeFactory.create(options?.restoreIdentifier, (peripherals: NativeBLEDevice[]) => this.onNativeRestoreStateCallback(peripherals));
+    this._native = BleNitroNativeFactory.create(options?.restoreIdentifier, (peripherals: NativeBLEDevice[]) =>
+      this._onNativeRestoredState(peripherals)
+    );
   }
 
-  private onNativeRestoreStateCallback(peripherals: NativeBLEDevice[]) {
-    if (!this._restoreStateIdentifier) return;
-    const bleDevices = peripherals.map((peripheral) => convertNativeBleDeviceToBleDevice(peripheral));
+  /**
+   * The native manager (a Nitro HybridObject), for native modules that use it
+   * from C++: pass it to a Nitro method taking a HybridObject and
+   * `std::dynamic_pointer_cast<HybridNativeBleNitroSpec>` it there.
+   */
+  public get nativeObject(): NativeBleNitro {
+    return this._native;
+  }
+
+  private _onNativeRestoredState(peripherals: NativeBLEDevice[]): void {
+    const devices = peripherals.map(toBleDevice);
     if (this._restoredStateCallback) {
-      this._restoredStateCallback(bleDevices);
+      this._restoredStateCallback(devices);
     } else {
-      this._restoredState = bleDevices;
+      this._restoredState = [...(this._restoredState ?? []), ...devices];
     }
   }
 
@@ -208,40 +295,40 @@ export class BleNitroManager {
    * No-op on Android.
    */
   public iosLazyInit(): void {
-    this.Instance.iosLazyInit();
+    this._sync(undefined, () => this._native.iosLazyInit());
   }
 
   /**
-   *
-   * Registers callback and returns restored peripheral state in it. Not working from 1.7.x upwards for singleton implementation!
-   * @deprecated This method is deprecated and will be removed in 2.x, use onRestoredState option in BleNitroManageroptions instead!
+   * Sets the callback for iOS state restoration (the peripherals iOS kept
+   * connected while the app was not running). Peripherals restored before a
+   * callback was set are kept and passed to the first callback set, once.
+   * Only works with a `restoreIdentifier` (not with the BleNitro singleton).
    */
-  public onRestoredState(callback: RestoreStateCallback) {
-    if (!this._restoreStateIdentifier) return;
-    if (this._restoredState) {
-      callback(this._restoredState);
-      this._restoredState = null;
-    }
+  public onRestoredState(callback: RestoreStateCallback): void {
     this._restoredStateCallback = callback;
+    const restored = this._restoredState;
+    if (restored) {
+      this._restoredState = null;
+      callback(restored);
+    }
   }
 
   /**
-   * Converts a 16- oder 32-Bit UUID to a 128-Bit UUID
+   * Converts a 16- or 32-bit UUID to a lowercase 128-bit UUID.
    *
-   * @param uuid 16-, 32- or 128-Bit UUID as string
-   * @returns Full 128-Bit UUID
+   * @param uuid 16-, 32- or 128-bit UUID as string
+   * @returns Full lowercase 128-bit UUID
    */
   public static normalizeGattUUID(uuid: string): string {
     const cleanUuid = uuid.toLowerCase();
 
-    // 128-Bit UUID → normalisieren
-    if (cleanUuid.length === 36 && cleanUuid.includes("-")) {
+    // Already a 128-bit UUID
+    if (cleanUuid.length === 36 && cleanUuid.includes('-')) {
       return cleanUuid;
     }
 
-    // GATT-Service UUIDs
-    // 16- oder 32-Bit UUID → 128-Bit UUID
-    const padded = cleanUuid.padStart(8, "0");
+    // 16- or 32-bit UUID on the Bluetooth base UUID
+    const padded = cleanUuid.padStart(8, '0');
     return `${padded}-0000-1000-8000-00805f9b34fb`;
   }
 
@@ -250,603 +337,466 @@ export class BleNitroManager {
   }
 
   /**
-   * Start scanning for Bluetooth devices
-   * @param filter Optional scan filter
-   * @param callback Callback function called when a device is found
-   * @returns void
+   * Starts scanning. Only one scan runs at a time: starting a scan stops the
+   * previous one, whose callbacks are not called anymore.
+   *
+   * @param onError Called once if the scan fails to start or stops by itself;
+   *   the scan is over then. Without it, such a failure is thrown from the
+   *   native callback, i.e. it reaches the global error handler.
    */
-  public startScan(
-    filter: ScanFilter = {},
-    callback: ScanCallback,
-    onError?: (error: string) => void,
-  ): void {
-    if (this._isScanning) {
-      return;
-    }
+  public startScan(filter: ScanFilter = {}, onDevice: ScanCallback, onError?: ScanErrorCallback): void {
+    this._startScan(filter, onDevice, onError);
+  }
 
-    // Create native scan filter with defaults
+  private _startScan(filter: ScanFilter, onDevice: ScanCallback, onError: ScanErrorCallback | undefined): ScanSession {
+    this._assertAlive(undefined);
     const nativeFilter: NativeScanFilter = {
-      serviceUUIDs: filter.serviceUUIDs || [],
-      rssiThreshold: filter.rssiThreshold ?? -100,
+      serviceUUIDs: BleNitroManager.normalizeGattUUIDs(filter.serviceUUIDs ?? []),
+      rssiThreshold: filter.rssiThreshold,
       allowDuplicates: filter.allowDuplicates ?? false,
-      androidScanMode: mapAndroidScanModeToNativeAndroidScanMode(filter.androidScanMode ?? AndroidScanMode.Balanced),
+      androidScanMode: SCAN_MODE_TO_NATIVE[filter.androidScanMode ?? AndroidScanMode.Balanced],
     };
-
-    // Create callback wrapper
-    const scanCallback: NativeScanCallback = (device: NativeBLEDevice | null, error: string | null) => {
-      if (error && !device) {
-        this._isScanning = false;
-        onError?.(error);
-        return;
-      }
-      device = device!; // eslint-disable-line @typescript-eslint/no-non-null-assertion
-      // Convert manufacturer data to Uint8Arrays
-      const convertedDevice: BLEDevice = convertNativeBleDeviceToBleDevice(device);
-      callback(convertedDevice);
-    };
-
-    // Start scan
-    this.Instance.startScan(nativeFilter, scanCallback);
-    this._isScanning = true;
-  }
-
-  /**
-   * Stop scanning for Bluetooth devices
-   * @returns void
-   */
-  public stopScan(): void {
-    if (!this._isScanning) {
-      return;
+    if (this._scanSession) {
+      this._sync(undefined, () => this._native.stopScan());
     }
-
-    this.Instance.stopScan();
-    this._isScanning = false;
+    const session: ScanSession = {};
+    this._scanSession = session;
+    this._sync(undefined, () =>
+      this._native.startScan(nativeFilter, (device, error) => {
+        if (this._scanSession !== session) return;
+        if (error) {
+          this._scanSession = null;
+          const bleError = bleErrorFromNative(error, undefined);
+          if (!onError) throw bleError;
+          onError(bleError);
+          return;
+        }
+        if (device) onDevice(toBleDevice(device));
+      })
+    );
+    return session;
   }
 
-  /**
-   * Check if currently scanning for devices
-   * @returns Boolean indicating if currently scanning
-   */
+  /** Stops the scan. No callback of it is called after this returns. */
+  public stopScan(): void {
+    if (this._destroyed) return;
+    this._scanSession = null;
+    this._sync(undefined, () => this._native.stopScan());
+  }
+
   public isScanning(): boolean {
-    this._isScanning = this.Instance.isScanning();
-    return this._isScanning;
+    return this._sync(undefined, () => this._native.isScanning());
   }
 
   /**
-   * Get all currently connected devices
-   * @param services Optional list of service UUIDs to filter by
-   * @returns Array of connected devices
+   * Devices connected to this phone (also by other apps), optionally only
+   * those with one of the given services.
    */
   public getConnectedDevices(services?: string[]): BLEDevice[] {
-    const devices = this.Instance.getConnectedDevices(services || []);
-    // Normalize service UUIDs - manufacturer data already comes as ArrayBuffers
-    return devices.map(device => convertNativeBleDeviceToBleDevice(device));
+    const serviceUUIDs = BleNitroManager.normalizeGattUUIDs(services ?? []);
+    return this._sync(undefined, () => this._native.getConnectedDevices(serviceUUIDs)).map(toBleDevice);
   }
 
   /**
-   * Connect to a Bluetooth device
-   * @param deviceId ID of the device to connect to
-   * @param onDisconnect Optional callback for disconnect events
-   * @returns Promise resolving deviceId when connected
+   * Connects to a device and resolves with its id once the link is up.
+   *
+   * Connecting to a device that is already connected (e.g. restored by iOS)
+   * resolves and installs `onDisconnect`. While another connect to the device
+   * is pending, rejects with DeviceAlreadyConnected. disconnect() cancels a
+   * pending connect, which then rejects with OperationCancelled.
+   *
+   * @param onDisconnect Called once when this link goes down.
    */
-  public connect(
-    deviceId: string, 
-    onDisconnect?: DisconnectEventCallback,
-    autoConnectAndroid?: boolean,
-  ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      // Check if already connected
-      if (this.isConnected(deviceId)) {
-        resolve(deviceId);
-        return;
-      }
-
-      this.Instance.connect(
-        deviceId,
-        (success: boolean, connectedDeviceId: string, error: string) => {
-          if (success) {
-            resolve(connectedDeviceId);
-          } else {
-            reject(new Error(error));
-          }
-        },
-        onDisconnect ? (deviceId: string, interrupted: boolean, error: string) => {
-          onDisconnect(deviceId, interrupted, error);
-        } : undefined,
-        autoConnectAndroid ?? false,
-      );
-    });
+  public connect(deviceId: string, options: ConnectOptions = {}, onDisconnect?: DisconnectEventCallback): Promise<string> {
+    const nativeOptions: NativeConnectOptions = {
+      autoConnect: options.autoConnectAndroid,
+      refreshGatt: options.refreshGattAndroid,
+      timeoutMs: options.timeoutMs,
+    };
+    const disconnectCallback = onDisconnect
+      ? (id: string, interrupted: boolean, error: NativeBleError | undefined) =>
+          onDisconnect(id, interrupted, error && bleErrorFromNative(error, id))
+      : undefined;
+    return this._operation(deviceId, (callback) =>
+      this._native.connect(deviceId, nativeOptions, callback, disconnectCallback)
+    ).then(() => deviceId);
   }
 
   /**
-   * Scans for a device and connects to it
-   * @param deviceId ID of the device to connect to
-   * @param scanTimeout Optional timeout for the scan in milliseconds (default: 5000ms)
-   * @returns Promise resolving deviceId when connected
+   * Scans for a device and connects to it. A device that is already connected
+   * is connected to without scanning.
+   *
+   * Rejects with DeviceNotFound when the scan doesn't find the device within
+   * `scanTimeout`, or with the scan's or the connect's error. Starting another
+   * scan meanwhile stops this one.
    */
-  public findAndConnect(deviceId: string, options?: { scanTimeout?: number, autoConnectAndroid?: boolean, onDisconnect?: DisconnectEventCallback, onFound?: (device: BLEDevice) => void }): Promise<string> {
+  public async findAndConnect(deviceId: string, options: FindAndConnectOptions = {}): Promise<string> {
+    const { scanTimeout = FIND_AND_CONNECT_SCAN_TIMEOUT_MS, onDisconnect, onFound, ...connectOptions } = options;
     if (this.isConnected(deviceId)) {
-      return Promise.resolve(deviceId);
+      return this.connect(deviceId, connectOptions, onDisconnect);
     }
-    if (this._isScanning) {
-      this.stopScan();
-    }
-    return new Promise((resolve, reject) => {
-      const timeoutScan = setTimeout(() => {
-        this.stopScan();
-        reject(new Error('Scan timed out'));
-      }, options?.scanTimeout ?? 5000);
-      this.startScan(undefined, (device) => {
-        if (device.id === deviceId) {
+    return new Promise<string>((resolve, reject) => {
+      const session = this._startScan(
+        {},
+        (device) => {
+          if (device.id !== deviceId) return;
+          clearTimeout(timer);
           this.stopScan();
-          clearTimeout(timeoutScan);
-          options?.onFound?.(device);
-          this.connect(deviceId, options?.onDisconnect, options?.autoConnectAndroid).then(async (connectedDeviceId) => {
-            resolve(connectedDeviceId);
-          }).catch((error) => {
-            reject(error);
-          });
-        }
-      });
-    });
-  }
-
-  /**
-   * Disconnect from a Bluetooth device
-   * @param deviceId ID of the device to disconnect from
-   * @returns Promise resolving with devices uuid or mac address when disconnected
-   */
-  public disconnect(deviceId: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      // Check if already disconnected
-      if (!this.isConnected(deviceId)) {
-        resolve(deviceId);
-        return;
-      }
-
-      this.Instance.disconnect(
-        deviceId,
-        (success: boolean, error: string) => {
-          if (success) {
-            resolve(deviceId);
-          } else {
-            reject(new Error(error));
-          }
+          this.connect(deviceId, connectOptions, onDisconnect).then(resolve, reject);
+          onFound?.(device);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
         }
       );
+      const timer = setTimeout(() => {
+        if (this._scanSession === session) this.stopScan();
+        reject(
+          new BleError(BleErrorCode.DeviceNotFound, `Device ${deviceId} not found within ${scanTimeout} ms of scanning`, {
+            deviceId,
+          })
+        );
+      }, scanTimeout);
     });
   }
 
   /**
-   * Check if connected to a device
-   * @param deviceId ID of the device to check
-   * @returns Boolean indicating if device is connected
+   * Disconnects from a device, or cancels a pending connect to it. Resolves
+   * once the link is down. Always goes to the native side, whatever
+   * isConnected() says; rejects with DeviceNotConnected when there is neither
+   * a link nor a pending connect.
    */
+  public disconnect(deviceId: string): Promise<void> {
+    return this._operation(deviceId, (callback) => this._native.disconnect(deviceId, callback));
+  }
+
   public isConnected(deviceId: string): boolean {
-    return this.Instance.isConnected(deviceId);
+    return this._sync(deviceId, () => this._native.isConnected(deviceId));
   }
 
   /**
-   * Request a new MTU size
-   * @param deviceId ID of the device
-   * @param mtu New MTU size, min is 23, max is 517
-   * @returns On Android: new MTU size; on iOS: current MTU size as it is handled by iOS itself; on error: -1
+   * Requests an ATT MTU and resolves with the ATT MTU in effect: on Android
+   * the negotiated one, on iOS the one CoreBluetooth negotiated by itself
+   * (iOS ignores the requested value).
+   * @param mtu Requested ATT MTU, 23 to 517
    */
-  public requestMTU(deviceId: string, mtu: number): number {
-    mtu = parseInt(mtu.toString(), 10);
-    const deviceMtu = this.Instance.requestMTU(deviceId, mtu);
-    return deviceMtu;
+  public requestMTU(deviceId: string, mtu: number): Promise<number> {
+    return this._request<number>(deviceId, (callback) => this._native.requestMTU(deviceId, mtu, callback));
   }
 
   /**
-   * Request an Android connection priority for an active connection.
-   * @param deviceId ID of the device
-   * @param priority Desired Android connection priority
-   * @returns On Android: true if the request was successfully initiated (the
-   *   priority change itself is applied asynchronously); on iOS, an error, or a
-   *   disconnected device: false
+   * Requests an Android connection priority. Resolves when Android accepted
+   * the request (the change itself applies asynchronously); resolves at once
+   * on iOS.
    */
-  public requestConnectionPriority(
-    deviceId: string,
-    priority: AndroidConnectionPriority
-  ): boolean {
-    return this.Instance.requestConnectionPriority(
-      deviceId,
-      mapAndroidConnectionPriorityToNativeAndroidConnectionPriority(priority)
+  public requestConnectionPriority(deviceId: string, priority: AndroidConnectionPriority): Promise<void> {
+    const nativePriority = CONNECTION_PRIORITY_TO_NATIVE[priority];
+    return this._operation(deviceId, (callback) =>
+      this._native.requestConnectionPriority(deviceId, nativePriority, callback)
     );
   }
 
-  /**
-   * Read RSSI for a connected device
-   * @param deviceId ID of the device
-   * @returns Promise resolving to RSSI value
-   */
   public readRSSI(deviceId: string): Promise<number> {
-    return new Promise((resolve, reject) => {
-      // Check if connected first
-      if (!this.isConnected(deviceId)) {
-        reject(new Error('Device not connected'));
-        return;
-      }
+    return this._request<number>(deviceId, (callback) => this._native.readRSSI(deviceId, callback));
+  }
 
-      this.Instance.readRSSI(
-        deviceId,
-        (success: boolean, rssi: number, error: string) => {
-          if (success) {
-            resolve(rssi);
-          } else {
-            reject(new Error(error));
-          }
-        }
-      );
-    });
+  /** Discovers the device's services. */
+  public discoverServices(deviceId: string): Promise<void> {
+    return this._operation(deviceId, (callback) => this._native.discoverServices(deviceId, callback));
+  }
+
+  /** Discovers the services and resolves with their lowercase 128-bit UUIDs. */
+  public async getServices(deviceId: string): Promise<string[]> {
+    await this.discoverServices(deviceId);
+    return BleNitroManager.normalizeGattUUIDs(this._sync(deviceId, () => this._native.getServices(deviceId)));
   }
 
   /**
-   * Discover services for a connected device
-   * @param deviceId ID of the device
-   * @returns Promise resolving when services are discovered
+   * The lowercase 128-bit UUIDs of a discovered service's characteristics.
+   * Needs a completed discovery (getServicesWithCharacteristics).
    */
-  public discoverServices(deviceId: string): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      // Check if connected first
-      if (!this.isConnected(deviceId)) {
-        reject(new Error('Device not connected'));
-        return;
-      }
-
-      this.Instance.discoverServices(
-        deviceId,
-        (success: boolean, error: string) => {
-          if (success) {
-            resolve(true);
-          } else {
-            reject(new Error(error));
-          }
-        }
-      );
-    });
+  public getCharacteristics(deviceId: string, serviceId: string): string[] {
+    const service = BleNitroManager.normalizeGattUUID(serviceId);
+    return BleNitroManager.normalizeGattUUIDs(this._sync(deviceId, () => this._native.getCharacteristics(deviceId, service)));
   }
 
   /**
-   * Get services for a connected device
-   * @param deviceId ID of the device
-   * @returns Promise resolving to array of service UUIDs
-   */
-  public getServices(deviceId: string): Promise<string[]> {
-    return new Promise(async (resolve, reject) => {
-      // Check if connected first
-      if (!this.isConnected(deviceId)) {
-        reject(new Error('Device not connected'));
-        return;
-      }
-
-      const success = await this.discoverServices(deviceId);
-      if (!success) {
-        reject(new Error('Failed to discover services'));
-        return;
-      }
-      const services = this.Instance.getServices(deviceId);
-      resolve(BleNitroManager.normalizeGattUUIDs(services));
-    });
-  }
-
-  /**
-   * Get characteristics for a service
-   * @param deviceId ID of the device
-   * @param serviceId ID of the service
-   * @returns array of characteristic UUIDs
-   */
-  public getCharacteristics(
-    deviceId: string,
-    serviceId: string
-  ): string[] {
-    if (!this.isConnected(deviceId)) {
-      throw new Error('Device not connected');
-    }
-
-    const characteristics = this.Instance.getCharacteristics(
-      deviceId,
-      BleNitroManager.normalizeGattUUID(serviceId),
-    );
-    return BleNitroManager.normalizeGattUUIDs(characteristics);
-  }
-
-  /**
-   * Get services and characteristics for a connected device.
-   * Uses a native method that waits for both service and characteristic
-   * discovery to complete before reading, avoiding the CoreBluetooth race
-   * where didDiscoverServices may not re-fire for cached services.
-   * @param deviceId ID of the device
-   * @returns Promise resolving to array of service and characteristic UUIDs
-   * @see getServices
-   * @see getCharacteristics
+   * Discovers all services and their characteristics and resolves with their
+   * lowercase 128-bit UUIDs. Resolves only after characteristic discovery
+   * completed, avoiding the CoreBluetooth race where didDiscoverServices may
+   * not fire again for cached services.
    */
   public async getServicesWithCharacteristics(
     deviceId: string
   ): Promise<{ uuid: string; characteristics: string[] }[]> {
-    await this._discoverServicesWithCharacteristics(deviceId);
-
-    const services = this.Instance.getServices(deviceId);
-    return BleNitroManager.normalizeGattUUIDs(services).map((service) => ({
+    await this._operation(deviceId, (callback) =>
+      this._native.discoverServicesWithCharacteristics(deviceId, callback)
+    );
+    const services = BleNitroManager.normalizeGattUUIDs(this._sync(deviceId, () => this._native.getServices(deviceId)));
+    return services.map((service) => ({
       uuid: service,
       characteristics: this.getCharacteristics(deviceId, service),
     }));
   }
 
-  private static readonly DISCOVERY_TIMEOUT_MS = 30_000;
-
-  private _discoverServicesWithCharacteristics(
-    deviceId: string
-  ): Promise<void> {
-    const inner = new Promise<void>((resolve, reject) => {
-      if (!this.isConnected(deviceId)) {
-        reject(new Error('Device not connected'));
-        return;
-      }
-      this.Instance.discoverServicesWithCharacteristics(
-        deviceId,
-        (success: boolean, error: string) => {
-          if (success) {
-            resolve();
-          } else {
-            reject(new Error(error));
-          }
-        }
-      );
-    });
-    return withTimeout(
-      inner,
-      BleNitroManager.DISCOVERY_TIMEOUT_MS,
-      'discoverServicesWithCharacteristics'
+  public readCharacteristic(deviceId: string, serviceId: string, characteristicId: string): Promise<ArrayBuffer> {
+    const service = BleNitroManager.normalizeGattUUID(serviceId);
+    const characteristic = BleNitroManager.normalizeGattUUID(characteristicId);
+    return this._request<ArrayBuffer>(deviceId, (callback) =>
+      this._native.readCharacteristic(deviceId, service, characteristic, callback)
     );
   }
 
   /**
-   * Read a characteristic value
-   * @param deviceId ID of the device
-   * @param serviceId ID of the service
-   * @param characteristicId ID of the characteristic
-   * @returns Promise resolving to the characteristic data as ByteArray
-   */
-  public readCharacteristic(
-    deviceId: string,
-    serviceId: string,
-    characteristicId: string
-  ): Promise<ByteArray> {
-    return new Promise((resolve, reject) => {
-      // Check if connected first
-      if (!this.isConnected(deviceId)) {
-        reject(new Error('Device not connected'));
-        return;
-      }
-
-      this.Instance.readCharacteristic(
-        deviceId,
-        BleNitroManager.normalizeGattUUID(serviceId),
-        BleNitroManager.normalizeGattUUID(characteristicId),
-        (success: boolean, data: ArrayBuffer, error: string) => {
-          if (success) {
-            resolve(arrayBufferToByteArray(data));
-          } else {
-            reject(new Error(error));
-          }
-        }
-      );
-    });
-  }
-
-  /**
-   * Write a value to a characteristic
-   * @param deviceId ID of the device
-   * @param serviceId ID of the service
-   * @param characteristicId ID of the characteristic
-   * @param data Data to write as ByteArray (number[])
-   * @param withResponse Whether to wait for response
-   * @returns Promise resolving with response data (empty ByteArray when withResponse=false)
+   * Writes a characteristic and resolves with the bytes written (both write
+   * types).
+   *
+   * A write without response resolves when the OS accepted it for sending
+   * (Android onCharacteristicWrite, iOS canSendWriteWithoutResponse), so
+   * awaiting each write paces a burst instead of overflowing the OS buffers.
+   * The bytes are copied during the call; `data` may be reused right after.
+   *
+   * @param data The bytes. A number[] is converted once, an ArrayBuffer is passed as is.
    */
   public writeCharacteristic(
     deviceId: string,
     serviceId: string,
     characteristicId: string,
-    data: ByteArray,
+    data: ArrayBuffer | ByteArray,
     withResponse: boolean = true
-  ): Promise<ByteArray> {
-    return new Promise((resolve, reject) => {
-      // Check if connected first
-      if (!this.isConnected(deviceId)) {
-        reject(new Error('Device not connected'));
-        return;
-      }
-
-      this.Instance.writeCharacteristic(
-        deviceId,
-        BleNitroManager.normalizeGattUUID(serviceId),
-        BleNitroManager.normalizeGattUUID(characteristicId),
-        byteArrayToArrayBuffer(data),
-        withResponse,
-        (success: boolean, responseData: ArrayBuffer, error: string) => {
-          if (success) {
-            // Convert ArrayBuffer response to ByteArray
-            const responseByteArray = arrayBufferToByteArray(responseData);
-            resolve(responseByteArray);
-          } else {
-            reject(new Error(error));
-          }
-        }
-      );
-    });
-  }
-
-  /**
-   * Subscribe to characteristic notifications
-   * @param deviceId ID of the device
-   * @param serviceId ID of the service
-   * @param characteristicId ID of the characteristic
-   * @param callback Callback function called when notification is received
-   * @returns Promise resolving to AsyncSubscription when subscription is established
-   */
-  public async subscribeToCharacteristic(
-    deviceId: string,
-    serviceId: string,
-    characteristicId: string,
-    callback: CharacteristicUpdateCallback
-  ): Promise<AsyncSubscription> {
-    return new Promise((resolve, reject) => {
-      // Check if connected first
-      if (!this.isConnected(deviceId)) {
-        reject(new Error('Device not connected'));
-        return;
-      }
-
-      this.Instance.subscribeToCharacteristic(
-        deviceId,
-        BleNitroManager.normalizeGattUUID(serviceId),
-        BleNitroManager.normalizeGattUUID(characteristicId),
-        (charId: string, data: ArrayBuffer) => {
-          callback(charId, arrayBufferToByteArray(data));
-        },
-        (success: boolean, error: string) => {
-          if (!success) {
-            reject(new Error(error || 'Failed to subscribe to characteristic'));
-            return;
-          }
-
-          const sub: AsyncSubscription = {
-            remove: async () => {
-              await this.unsubscribeFromCharacteristic(
-                deviceId,
-                serviceId,
-                characteristicId
-              ).catch(() => {});
-            }
-          };
-
-          resolve(sub);
-        }
-      );
-    });
-  }
-
-  /**
-   * Unsubscribe from characteristic notifications
-   * @param deviceId ID of the device
-   * @param serviceId ID of the service
-   * @param characteristicId ID of the characteristic
-   * @returns Promise resolving when unsubscription is complete
-   */
-  public unsubscribeFromCharacteristic(
-    deviceId: string,
-    serviceId: string,
-    characteristicId: string
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      // Check if connected first
-      if (!this.isConnected(deviceId)) {
-        reject(new Error('Device not connected'));
-        return;
-      }
-
-      this.Instance.unsubscribeFromCharacteristic(
-        deviceId,
-        BleNitroManager.normalizeGattUUID(serviceId),
-        BleNitroManager.normalizeGattUUID(characteristicId),
-        (success: boolean, error: string) => {
-          if (success) {
-            resolve();
-          } else {
-            reject(new Error(error));
-          }
-        }
-      );
-    });
-  }
-
-  /**
-   * Check if currently subscribed to a characteristic's notifications
-   * @param deviceId ID of the device
-   * @param serviceId ID of the service
-   * @param characteristicId ID of the characteristic
-   * @returns Boolean indicating if subscribed to notifications
-   */
-  public isSubscribedToCharacteristic(
-    deviceId: string,
-    serviceId: string,
-    characteristicId: string
-  ): boolean {
-    // No isConnected guard — both native implementations already return false
-    // for disconnected devices, and an extra check would introduce a TOCTOU race.
-    return this.Instance.isSubscribedToCharacteristic(
-      deviceId,
-      BleNitroManager.normalizeGattUUID(serviceId),
-      BleNitroManager.normalizeGattUUID(characteristicId)
+  ): Promise<ArrayBuffer> {
+    const service = BleNitroManager.normalizeGattUUID(serviceId);
+    const characteristic = BleNitroManager.normalizeGattUUID(characteristicId);
+    const buffer = Array.isArray(data) ? new Uint8Array(data).buffer : data;
+    return this._request<ArrayBuffer>(deviceId, (callback) =>
+      this._native.writeCharacteristic(deviceId, service, characteristic, buffer, withResponse, callback)
     );
   }
 
   /**
-   * Check if Bluetooth is enabled
-   * @returns returns Boolean according to Bluetooth state
+   * Enables notifications (or indications) of a characteristic and resolves
+   * once the device acknowledged it (CCCD written). `onValue` gets each
+   * value's bytes as an ArrayBuffer of its own.
+   *
+   * There is one subscription per characteristic: subscribing again replaces
+   * the previous one, which then gets no more values and whose remove() does
+   * nothing. remove() rejects if the unsubscribe fails.
    */
+  public subscribeToCharacteristic(
+    deviceId: string,
+    serviceId: string,
+    characteristicId: string,
+    onValue: CharacteristicUpdateCallback
+  ): Promise<AsyncSubscription> {
+    const service = BleNitroManager.normalizeGattUUID(serviceId);
+    const characteristic = BleNitroManager.normalizeGattUUID(characteristicId);
+    const subscription: NotificationSubscription = { active: true };
+    return this._operation(deviceId, (callback) => {
+      this._native.subscribeToCharacteristic(
+        deviceId,
+        service,
+        characteristic,
+        (data) => {
+          if (subscription.active) onValue(data);
+        },
+        callback
+      );
+      this._replaceNotificationSubscription(deviceId, service, characteristic, subscription);
+    }).then(() => ({
+      remove: () =>
+        subscription.active
+          ? this.unsubscribeFromCharacteristic(deviceId, service, characteristic)
+          : Promise.resolve(),
+    }));
+  }
+
+  /** Disables notifications of a characteristic; its subscription gets no more values. */
+  public unsubscribeFromCharacteristic(deviceId: string, serviceId: string, characteristicId: string): Promise<void> {
+    const service = BleNitroManager.normalizeGattUUID(serviceId);
+    const characteristic = BleNitroManager.normalizeGattUUID(characteristicId);
+    return this._operation(deviceId, (callback) => {
+      this._native.unsubscribeFromCharacteristic(deviceId, service, characteristic, callback);
+      this._replaceNotificationSubscription(deviceId, service, characteristic, null);
+    });
+  }
+
+  private _replaceNotificationSubscription(
+    deviceId: string,
+    service: string,
+    characteristic: string,
+    subscription: NotificationSubscription | null
+  ): void {
+    const key = `${deviceId}|${service}|${characteristic}`;
+    const previous = this._notificationSubscriptions.get(key);
+    if (previous) previous.active = false;
+    if (subscription) {
+      this._notificationSubscriptions.set(key, subscription);
+    } else {
+      this._notificationSubscriptions.delete(key);
+    }
+  }
+
+  /** False for disconnected or unknown devices. */
+  public isSubscribedToCharacteristic(deviceId: string, serviceId: string, characteristicId: string): boolean {
+    const service = BleNitroManager.normalizeGattUUID(serviceId);
+    const characteristic = BleNitroManager.normalizeGattUUID(characteristicId);
+    return this._sync(deviceId, () => this._native.isSubscribedToCharacteristic(deviceId, service, characteristic));
+  }
+
   public isBluetoothEnabled(): boolean {
     return this.state() === BLEState.PoweredOn;
   }
 
   /**
-   * Request to enable Bluetooth (Android only)
-   * @returns Promise resolving when Bluetooth is enabled
+   * Android: asks the user to turn Bluetooth on. Rejects with
+   * BluetoothStateChangeFailed on iOS, which doesn't allow it.
    */
-  public requestBluetoothEnable(): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      this.Instance.requestBluetoothEnable(
-        (success: boolean, error: string) => {
-          if (success) {
-            resolve(true);
-          } else {
-            reject(new Error(error));
-          }
-        }
+  public requestBluetoothEnable(): Promise<void> {
+    return this._operation(undefined, (callback) => this._native.requestBluetoothEnable(callback));
+  }
+
+  public state(): BLEState {
+    return BLE_STATE_FROM_NATIVE[this._sync(undefined, () => this._native.state())];
+  }
+
+  /**
+   * Calls `callback` on every Bluetooth state change. Any number of
+   * subscriptions may exist; remove() removes only its own.
+   * @param emitInitial Also call `callback` with the current state right away.
+   */
+  public subscribeToStateChange(callback: StateChangeCallback, emitInitial = false): Subscription {
+    this._assertAlive(undefined);
+    if (this._stateListeners.size === 0) {
+      const result = this._sync(undefined, () =>
+        this._native.subscribeToStateChange((nativeState) => this._dispatchState(BLE_STATE_FROM_NATIVE[nativeState]))
       );
+      if (!result.success) {
+        throw new BleError(BleErrorCode.UnknownError, `Could not subscribe to Bluetooth state changes: ${result.error}`);
+      }
+    }
+    const listener: StateListener = { callback };
+    this._stateListeners.add(listener);
+    const subscription: Subscription = { remove: () => this._removeStateListener(listener) };
+    if (emitInitial) {
+      try {
+        callback(this.state());
+      } catch (error) {
+        subscription.remove();
+        throw error;
+      }
+    }
+    return subscription;
+  }
+
+  private _dispatchState(state: BLEState): void {
+    for (const listener of Array.from(this._stateListeners)) {
+      // A listener removed by an earlier one during this dispatch gets nothing.
+      if (!this._stateListeners.has(listener)) continue;
+      try {
+        listener.callback(state);
+      } catch (error) {
+        // Rethrown outside this loop so the error reaches the global error
+        // handler and one listener's bug doesn't keep the state from the others.
+        setTimeout(() => {
+          throw error;
+        }, 0);
+      }
+    }
+  }
+
+  private _removeStateListener(listener: StateListener): void {
+    if (!this._stateListeners.delete(listener) || this._stateListeners.size > 0) return;
+    const result = this._sync(undefined, () => this._native.unsubscribeFromStateChange());
+    if (!result.success) {
+      throw new BleError(BleErrorCode.UnknownError, `Could not unsubscribe from Bluetooth state changes: ${result.error}`);
+    }
+  }
+
+  /** Opens the system's Bluetooth settings. */
+  public openSettings(): Promise<void> {
+    return this._settle<void>(undefined, (resolve, reject) => {
+      this._native.openSettings().then(resolve, (thrown: unknown) => reject(bleErrorFromThrown(thrown, undefined)));
     });
   }
 
   /**
-   * Get the current Bluetooth state
-   * @returns Bluetooth state
-   * @see BLEState
+   * Stops scanning, closes every link, fails every pending operation with
+   * BluetoothManagerDestroyed and releases the OS resources. No callback is
+   * called afterwards (except those failing pending operations). Idempotent.
    */
-  public state(): BLEState {
-    return mapNativeBLEStateToBLEState(this.Instance.state());
+  public destroy(): void {
+    if (this._destroyed) return;
+    this._destroyed = true;
+    this._scanSession = null;
+    this._stateListeners.clear();
+    for (const subscription of this._notificationSubscriptions.values()) subscription.active = false;
+    this._notificationSubscriptions.clear();
+    this._restoredStateCallback = null;
+    this._restoredState = null;
+    try {
+      this._native.destroy();
+    } catch (thrown) {
+      throw bleErrorFromThrown(thrown, undefined);
+    }
+  }
+
+  private _assertAlive(deviceId: string | undefined): void {
+    if (this._destroyed) {
+      throw new BleError(BleErrorCode.BluetoothManagerDestroyed, 'The BleNitroManager was destroyed', { deviceId });
+    }
+  }
+
+  /** Runs a synchronous native call; anything it throws becomes a BleError. */
+  private _sync<T>(deviceId: string | undefined, call: () => T): T {
+    this._assertAlive(deviceId);
+    try {
+      return call();
+    } catch (thrown) {
+      throw bleErrorFromThrown(thrown, deviceId);
+    }
   }
 
   /**
-   * Subscribe to Bluetooth state changes
-   * @param callback Callback function called when state changes
-   * @param emitInitial Whether to emit initial state callback
-   * @returns Subscription
-   * @see BLEState
+   * The promise of one native operation. `start` issues it; whatever it
+   * throws rejects the promise.
    */
-  public subscribeToStateChange(callback: (state: BLEState) => void, emitInitial = false): Subscription {
-      if (emitInitial) {
-        const state = this.state();
-        callback(state);
+  private _settle<T>(
+    deviceId: string | undefined,
+    start: (resolve: (value: T) => void, reject: (error: BleError) => void) => void
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      try {
+        this._assertAlive(deviceId);
+        start(resolve, reject);
+      } catch (thrown) {
+        reject(bleErrorFromThrown(thrown, deviceId));
       }
-
-      this.Instance.subscribeToStateChange((nativeState: NativeBLEState) => {
-        callback(mapNativeBLEStateToBLEState(nativeState));
-      });
-
-      return {
-        remove: () => {
-          this.Instance.unsubscribeFromStateChange();
-        },
-      };
+    });
   }
 
-  /**
-   * Open Bluetooth settings
-   * @returns Promise resolving when settings are opened
-   */
-  public openSettings(): Promise<void> {
-    return this.Instance.openSettings();
+  /** An operation that completes with an error or nothing. */
+  private _operation(deviceId: string | undefined, start: (callback: NativeOperationCallback) => void): Promise<void> {
+    return this._settle<void>(deviceId, (resolve, reject) =>
+      start((error) => (error ? reject(bleErrorFromNative(error, deviceId)) : resolve()))
+    );
+  }
+
+  /** An operation that completes with an error or a result. */
+  private _request<T>(
+    deviceId: string | undefined,
+    start: (callback: (error: NativeBleError | undefined, result: T | undefined) => void) => void
+  ): Promise<T> {
+    return this._settle<T>(deviceId, (resolve, reject) =>
+      start((error, result) => {
+        if (error) {
+          reject(bleErrorFromNative(error, deviceId));
+        } else if (result === undefined) {
+          reject(new BleError(BleErrorCode.UnknownError, 'The native operation completed without a result', { deviceId }));
+        } else {
+          resolve(result);
+        }
+      })
+    );
   }
 }

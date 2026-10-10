@@ -1,934 +1,283 @@
 package com.margelo.nitro.co.zyke.ble
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
-import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.provider.Settings
+import android.util.Log
 import androidx.core.content.ContextCompat
-import com.margelo.nitro.core.*
+import androidx.core.location.LocationManagerCompat
+import com.margelo.nitro.core.ArrayBuffer
+import com.margelo.nitro.core.Promise
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
+import kotlin.math.min
 
 /**
- * Android implementation of the BLE Nitro Module
- * This class provides the actual BLE functionality for Android devices
+ * Android implementation of the BLE Nitro Module. The behavior contract is the
+ * documentation of src/specs/NativeBleNitro.nitro.ts.
+ *
+ * Threading:
+ * - One HandlerThread per manager owns all state (links, scan, adapter state)
+ *   and invokes every callback, JS or native, in event order. A callback
+ *   created in C++ by another native module therefore runs directly on that
+ *   thread, without the JS thread.
+ * - Public methods hop onto it. Methods with a callback post their work and
+ *   never run inline, so a callback that calls back into the manager is never
+ *   re-entered and calls keep their order. Synchronous getters block until the
+ *   thread ran them, or run inline when called on the thread itself.
+ * - GATT callbacks reach the thread as described in [GattConnection], scan
+ *   results (which the OS delivers on the main thread) are posted to it, and
+ *   the adapter state receiver is registered with its Handler.
+ * - After destroy() the thread is gone: a method with a callback then
+ *   completes at once on the calling thread with BluetoothManagerDestroyed,
+ *   and a getter returns its empty value.
+ *
+ * Errors: every failure of a method with a callback reaches the callback as a
+ * [BleError] (codes like ble-plx's, see BleErrors.kt), never as an exception.
+ * Synchronous getters throw instead: an invalid UUID string, or the
+ * SecurityException of getConnectedDevices without BLUETOOTH_CONNECT.
  */
 class BleNitroBleManager : HybridNativeBleNitroSpec() {
 
-    // iOS-specific property (not used on Android)
+    // iOS only (CoreBluetooth state restoration); unused on Android.
     override var restoreStateIdentifier: String? = null
 
-    private var bluetoothAdapter: BluetoothAdapter? = null
+    /** The adapter and the app context it came from. */
+    private class Bluetooth(val context: Context, val adapter: BluetoothAdapter)
+
+    private val thread = HandlerThread("BleNitro").apply { start() }
+    private val handler = Handler(thread.looper)
+
+    // Everything below is touched on the handler thread only.
+    private var destroyed = false
+    private var bluetooth: Bluetooth? = null
     private var stateCallback: ((state: BLEState) -> Unit)? = null
-    private var bluetoothStateReceiver: BroadcastReceiver? = null
-    private var restoreStateCallback: ((devices: List<BLEDevice>) -> Unit)? = null
-    
-    // BLE Scanning
-    private var bleScanner: BluetoothLeScanner? = null
-    private var isCurrentlyScanning = false
-    private var scanCallback: ScanCallback? = null
-    private var deviceFoundCallback: ((device: Variant_NullType_BLEDevice?, error: Variant_NullType_String?) -> Unit)? = null
-    private val discoveredDevicesInCurrentScan = mutableSetOf<String>()
-    
-    // Device connections
-    private val connectedDevices = ConcurrentHashMap<String, BluetoothGatt>()
-    private val deviceCallbacks = ConcurrentHashMap<String, DeviceCallbacks>()
-    
-    // Read callback storage for proper response handling (key: deviceId:characteristicId)
-    private val readCallbacks = ConcurrentHashMap<String, (Boolean, ArrayBuffer, String) -> Unit>()
+    private val links = HashMap<String, GattConnection>()
+    private var scan: ActiveScan? = null
+    private val scanThrottle = ScanStartThrottle()
+    private var scanPermissionNeverForLocation: Boolean? = null
 
-    // Write callback storage for proper response handling (key: deviceId:characteristicId)
-    private val writeCallbacks = ConcurrentHashMap<String, (Boolean, ArrayBuffer, String) -> Unit>()
-
-    // RSSI callback storage (key: deviceId)
-    private val rssiCallbacks = ConcurrentHashMap<String, (Boolean, Double, String) -> Unit>()
-
-    // GATT operation queue for sequential descriptor writes (Android BLE requirement)
-    private val gattOperationQueue = java.util.concurrent.LinkedBlockingQueue<GattOperation>()
-    private var isGattOperationInProgress = false
-    private val gattOperationLock = Any()
-
-    // Descriptor write callback storage (key: deviceId:descriptorUuid)
-    private val descriptorWriteCallbacks = ConcurrentHashMap<String, (Boolean, String) -> Unit>()
-
-    // Android permits only one outstanding ATT operation per GATT connection.
-    // Defer service discovery while an MTU request is in flight so the two
-    // procedures cannot overlap when JS calls them back-to-back.
-    // All three maps below are guarded by mtuGateLock, so plain HashMaps suffice.
-    private val mtuInFlight = HashMap<String, Boolean>()
-    private val pendingDiscovery = HashMap<String, () -> Unit>()
-    private val mtuFallbackRunnables = HashMap<String, Runnable>()
-    private val mtuHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private val mtuGateLock = Any()
-    private val mtuSettleFallbackMs = 1000L
-    
-    // Helper class to store device callbacks
-    private data class DeviceCallbacks(
-        var connectCallback: ((success: Boolean, deviceId: String, error: String) -> Unit)? = null,
-        var disconnectCallback: ((deviceId: String, interrupted: Boolean, error: String) -> Unit)? = null,
-        var serviceDiscoveryCallback: ((success: Boolean, error: String) -> Unit)? = null,
-        // Key: "serviceId:characteristicId" for correct scoping when the same
-        // characteristic UUID exists under multiple services.
-        var characteristicSubscriptions: MutableMap<String, (characteristicId: String, data: ArrayBuffer) -> Unit> = ConcurrentHashMap()
-    )
-
-    // Sealed class for GATT operations that need to be queued
-    private sealed class GattOperation {
-        data class WriteDescriptor(
-            val gatt: BluetoothGatt,
-            val descriptor: BluetoothGattDescriptor,
-            val value: ByteArray,
-            val deviceId: String,
-            val callback: (Boolean, String) -> Unit
-        ) : GattOperation()
+    private val adapterStateReceiver = object : BroadcastReceiver() {
+        // Registered with the handler, so this runs on the handler thread.
+        override fun onReceive(context: Context, intent: Intent) {
+            onAdapterStateChanged(intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR))
+        }
     }
-    
+
     init {
-        // Try to get context from React Native application context
-        tryToGetContextFromReactNative()
+        // Registers the adapter state receiver right away: links must be dropped
+        // when Bluetooth turns off even if nobody subscribed to state changes.
+        handler.post { bluetooth() }
     }
-    
+
     companion object {
+        private const val TAG = "BleNitro"
+
+        /** HCI "RSSI not available": the RSSI of a device known without an advertisement (iOS reports the same). */
+        private const val RSSI_UNAVAILABLE = 127.0
+
+        @Volatile
         private var appContext: Context? = null
-        
+
         fun setContext(context: Context) {
             appContext = context.applicationContext
         }
-        
+
         fun getContext(): Context? = appContext
-    }
-    
-    private fun tryToGetContextFromReactNative() {
-        if (appContext == null) {
-            try {
-                // Try to get Application context using reflection
-                val activityThread = Class.forName("android.app.ActivityThread")
-                val currentApplicationMethod = activityThread.getMethod("currentApplication")
-                val application = currentApplicationMethod.invoke(null) as? android.app.Application
-                
-                if (application != null) {
-                    setContext(application)
-                }
-            } catch (e: Exception) {
-                // Context will be set by package initialization if reflection fails
-            }
-        }
-    }
-    
-    private fun initializeBluetoothIfNeeded() {
-        if (bluetoothAdapter == null) {
-            try {
-                val context = appContext ?: return
-                val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-                bluetoothAdapter = bluetoothManager?.adapter
-            } catch (e: Exception) {
-                // Handle initialization error silently
-            }
-        }
-    }
-
-    private fun hasBluetoothPermissions(): Boolean {
-        val context = appContext ?: return false
-        
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Android 12+ (API 31+) - check new Bluetooth permissions
-            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-        } else {
-            // Android < 12 - check legacy permissions
-            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED
-        }
-    }
-
-    private fun getMissingPermissions(): List<String> {
-        val context = appContext ?: return emptyList()
-        val missing = mutableListOf<String>()
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Android 12+ permissions
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                missing.add(Manifest.permission.BLUETOOTH_CONNECT)
-            }
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-                missing.add(Manifest.permission.BLUETOOTH_SCAN)
-            }
-        } else {
-            // Legacy permissions
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) != PackageManager.PERMISSION_GRANTED) {
-                missing.add(Manifest.permission.BLUETOOTH)
-            }
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADMIN) != PackageManager.PERMISSION_GRANTED) {
-                missing.add(Manifest.permission.BLUETOOTH_ADMIN)
-            }
-        }
-        
-        // Location permissions for BLE scanning
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            missing.add(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
-        
-        return missing
-    }
-    
-    private fun bluetoothStateToBlEState(bluetoothState: Int): BLEState {
-        return when (bluetoothState) {
-            BluetoothAdapter.STATE_OFF -> BLEState.POWEREDOFF
-            BluetoothAdapter.STATE_ON -> BLEState.POWEREDON
-            BluetoothAdapter.STATE_TURNING_ON -> BLEState.RESETTING
-            BluetoothAdapter.STATE_TURNING_OFF -> BLEState.RESETTING
-            else -> BLEState.UNKNOWN
-        }
-    }
-    
-    private fun createBluetoothStateReceiver(): BroadcastReceiver {
-        return object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
-                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
-                    val bleState = bluetoothStateToBlEState(state)
-                    stateCallback?.invoke(bleState)
-                }
-            }
-        }
-    }
-    
-    private fun createBLEDeviceFromScanResult(scanResult: ScanResult): BLEDevice {
-        val device = scanResult.device
-        val scanRecord = scanResult.scanRecord
-        
-        // Extract manufacturer data
-        val manufacturerData = scanRecord?.manufacturerSpecificData?.let { sparseArray ->
-            val entries = mutableListOf<ManufacturerDataEntry>()
-            for (i in 0 until sparseArray.size()) {
-                val key = sparseArray.keyAt(i)
-                val value = sparseArray.get(key)
-                
-                // Create direct ByteBuffer as required by ArrayBuffer.wrap()
-                val directBuffer = java.nio.ByteBuffer.allocateDirect(value.size)
-                directBuffer.put(value)
-                directBuffer.flip()
-                
-                entries.add(ManufacturerDataEntry(
-                    id = key.toString(),
-                    data = ArrayBuffer.wrap(directBuffer)
-                ))
-            }
-            ManufacturerData(companyIdentifiers = entries.toTypedArray())
-        } ?: ManufacturerData(companyIdentifiers = emptyArray())
-        
-        // Extract service data
-        val serviceData = scanRecord?.serviceData?.let { dataMap ->
-            val entries = mutableListOf<ServiceDataEntry>()
-            for ((uuid, value) in dataMap) {
-                // Create direct ByteBuffer as required by ArrayBuffer.wrap()
-                val directBuffer = java.nio.ByteBuffer.allocateDirect(value.size)
-                directBuffer.put(value)
-                directBuffer.flip()
-
-                entries.add(ServiceDataEntry(
-                    uuid = uuid.toString(),
-                    data = ArrayBuffer.wrap(directBuffer)
-                ))
-            }
-            ServiceData(services = entries.toTypedArray())
-        } ?: ServiceData(services = emptyArray())
-
-        // Extract service UUIDs
-        val serviceUUIDs = scanRecord?.serviceUuids?.map { it.toString() }?.toTypedArray() ?: emptyArray()
-
-        return BLEDevice(
-            id = device.address,
-            name = device.name ?: "",
-            rssi = scanResult.rssi.toDouble(),
-            manufacturerData = manufacturerData,
-            serviceData = serviceData,
-            serviceUUIDs = serviceUUIDs,
-            isConnectable = true, // Assume scannable devices are connectable
-            isConnected = false // Scanned devices are not yet connected
-        )
-    }
-    
-    private fun createAndroidScanFilters(filter: com.margelo.nitro.co.zyke.ble.ScanFilter): List<android.bluetooth.le.ScanFilter> {
-        val filters = mutableListOf<android.bluetooth.le.ScanFilter>()
-        
-        // Add service UUID filters
-        filter.serviceUUIDs.forEach { serviceId ->
-            try {
-                val builder = android.bluetooth.le.ScanFilter.Builder()
-                val uuid = UUID.fromString(serviceId)
-                builder.setServiceUuid(ParcelUuid(uuid))
-                filters.add(builder.build())
-            } catch (e: Exception) {
-                // Invalid UUID, skip
-            }
-        }
-        
-        // If no specific filters, add empty filter to scan all devices
-        if (filters.isEmpty()) {
-            val builder = android.bluetooth.le.ScanFilter.Builder()
-            filters.add(builder.build())
-        }
-        
-        return filters
-    }
-    
-    private fun createGattCallback(deviceId: String): BluetoothGattCallback {
-        return object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                when (newState) {
-                    BluetoothProfile.STATE_CONNECTED -> {
-                        clearMtuGateState(deviceId)
-                        var connectCb: ((Boolean, String, String) -> Unit)? = null
-                        deviceCallbacks.compute(deviceId) { _, callbacks ->
-                            connectCb = callbacks?.connectCallback
-                            callbacks?.copy(connectCallback = null)
-                        }
-                        connectCb?.invoke(true, deviceId, "")
-                    }
-                    BluetoothProfile.STATE_DISCONNECTED -> {
-                        // Clean up
-                        clearMtuGateState(deviceId)
-                        connectedDevices.remove(deviceId)
-                        val interrupted = status != BluetoothGatt.GATT_SUCCESS
-                        val cb = deviceCallbacks.remove(deviceId)
-                        // If a discoverServices() call was still in flight (or deferred
-                        // behind an MTU request), it will never receive onServicesDiscovered
-                        // now. Fail it explicitly so the JS promise does not hang forever.
-                        cb?.serviceDiscoveryCallback?.invoke(false, "Disconnected before service discovery completed")
-                        cb?.disconnectCallback?.invoke(deviceId, interrupted, if (interrupted) "Connection lost" else "")
-                        gatt.close()
-                    }
-                }
-            }
-
-            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-                // Use the deviceId captured for this callback so the gate key always
-                // matches the one markMtuInFlight() recorded under.
-                settleMtu(deviceId)
-            }
-            
-            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                val callbacks = deviceCallbacks[deviceId]
-                val serviceDiscoveryCallback = callbacks?.serviceDiscoveryCallback
-                
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    serviceDiscoveryCallback?.invoke(true, "")
-                } else {
-                    serviceDiscoveryCallback?.invoke(false, "Service discovery failed with status: $status")
-                }
-                
-                // Clear the service discovery callback as it's one-time use
-                callbacks?.serviceDiscoveryCallback = null
-            }
-            
-            override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-                // Handle characteristic read result
-                val deviceId = gatt.device.address
-                val characteristicId = characteristic.uuid.toString()
-                val callbackKey = "$deviceId:$characteristicId"
-
-                readCallbacks.remove(callbackKey)?.let { callback ->
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        val value = characteristic.value ?: byteArrayOf()
-                        // Create direct ByteBuffer as required by ArrayBuffer.wrap()
-                        val directBuffer = java.nio.ByteBuffer.allocateDirect(value.size)
-                        directBuffer.put(value)
-                        directBuffer.flip()
-                        val data = ArrayBuffer.wrap(directBuffer)
-                        callback(true, data, "")
-                    } else {
-                        callback(false, ArrayBuffer.allocate(0), "Read failed with status: $status")
-                    }
-                }
-            }
-            
-            override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-                // Handle characteristic write result
-                val deviceId = gatt.device.address
-                val characteristicId = characteristic.uuid.toString()
-                val callbackKey = "$deviceId:$characteristicId"
-                
-                writeCallbacks.remove(callbackKey)?.let { callback ->
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        // Get response data from characteristic value (may be null/empty for acknowledgments)
-                        val responseData = characteristic.value ?: byteArrayOf()
-                        val directBuffer = java.nio.ByteBuffer.allocateDirect(responseData.size)
-                        directBuffer.put(responseData)
-                        directBuffer.flip()
-                        val arrayBuffer = ArrayBuffer.wrap(directBuffer)
-                        callback(true, arrayBuffer, "")
-                    } else {
-                        callback(false, ArrayBuffer.allocate(0), "Write failed with status: $status")
-                    }
-                }
-            }
-            
-            override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
-                val deviceId = gatt.device.address
-                
-                rssiCallbacks.remove(deviceId)?.let { callback ->
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        callback(true, rssi.toDouble(), "")
-                    } else {
-                        callback(false, 0.0, "RSSI read failed with status: $status")
-                    }
-                }
-            }
-            
-            override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-                // Handle characteristic notifications
-                val characteristicId = characteristic.uuid.toString()
-                val serviceId = characteristic.service?.uuid?.toString()
-                if (serviceId == null) {
-                    android.util.Log.w("BleNitro", "onCharacteristicChanged: characteristic.service is null for $characteristicId")
-                    return
-                }
-                val subscriptionKey = "$serviceId:$characteristicId"
-                val value = characteristic.value ?: byteArrayOf()
-
-                // Create direct ByteBuffer as required by ArrayBuffer.wrap()
-                val directBuffer = java.nio.ByteBuffer.allocateDirect(value.size)
-                directBuffer.put(value)
-                directBuffer.flip()
-
-                val data = ArrayBuffer.wrap(directBuffer)
-
-                val callbacks = deviceCallbacks[deviceId]
-                callbacks?.characteristicSubscriptions?.get(subscriptionKey)?.invoke(characteristicId, data)
-            }
-            
-            override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-                // Handle descriptor write (for enabling/disabling notifications)
-                val deviceId = gatt.device.address
-                val descriptorUuid = descriptor.uuid.toString()
-                val callbackKey = "$deviceId:$descriptorUuid"
-
-                // Get and invoke the stored callback
-                descriptorWriteCallbacks.remove(callbackKey)?.let { callback ->
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        callback(true, "")
-                    } else {
-                        callback(false, "Descriptor write failed with status: $status")
-                    }
-                }
-
-                // Process next queued operation
-                processNextGattOperation()
-            }
-        }
-    }
-
-    private fun runOrDeferDiscovery(deviceId: String, startDiscovery: () -> Unit) {
-        val shouldStartNow = synchronized(mtuGateLock) {
-            if (mtuInFlight[deviceId] == true) {
-                pendingDiscovery[deviceId] = startDiscovery
-                false
-            } else {
-                true
-            }
-        }
-
-        if (shouldStartNow) {
-            startDiscovery()
-        }
-    }
-
-    private fun markMtuInFlight(deviceId: String) {
-        synchronized(mtuGateLock) {
-            mtuInFlight[deviceId] = true
-            mtuFallbackRunnables.remove(deviceId)?.let { mtuHandler.removeCallbacks(it) }
-            val runnable = Runnable { settleMtu(deviceId) }
-            mtuFallbackRunnables[deviceId] = runnable
-            mtuHandler.postDelayed(runnable, mtuSettleFallbackMs)
-        }
-    }
-
-    private fun settleMtu(deviceId: String) {
-        val discoveryToStart = synchronized(mtuGateLock) {
-            mtuInFlight.remove(deviceId)
-            mtuFallbackRunnables.remove(deviceId)?.let { mtuHandler.removeCallbacks(it) }
-            pendingDiscovery.remove(deviceId)
-        }
-        // settleMtu can be invoked from the binder thread (onMtuChanged) or the main
-        // thread (fallback). Start the deferred discovery on the main looper so GATT
-        // operations are always issued from a single, consistent thread.
-        discoveryToStart?.let { mtuHandler.post(it) }
-    }
-
-    private fun clearMtuGateState(deviceId: String) {
-        synchronized(mtuGateLock) {
-            mtuInFlight.remove(deviceId)
-            pendingDiscovery.remove(deviceId)
-            mtuFallbackRunnables.remove(deviceId)?.let { mtuHandler.removeCallbacks(it) }
-        }
-    }
-
-    private fun mapAndroidConnectionPriority(androidConnectionPriority: AndroidConnectionPriority): Int {
-        return when (androidConnectionPriority) {
-            AndroidConnectionPriority.HIGH -> BluetoothGatt.CONNECTION_PRIORITY_HIGH
-            AndroidConnectionPriority.LOWPOWER -> BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
-            AndroidConnectionPriority.BALANCED -> BluetoothGatt.CONNECTION_PRIORITY_BALANCED
-        }
-    }
-
-    /**
-     * Enqueue a GATT operation to be executed sequentially.
-     * Android BLE requires that only one GATT operation runs at a time.
-     */
-    private fun enqueueGattOperation(operation: GattOperation) {
-        gattOperationQueue.add(operation)
-        processNextGattOperation()
-    }
-
-    /**
-     * Process the next GATT operation in the queue if none is currently running.
-     */
-    private fun processNextGattOperation() {
-        synchronized(gattOperationLock) {
-            if (isGattOperationInProgress) {
-                return
-            }
-
-            val operation = gattOperationQueue.poll() ?: return
-            isGattOperationInProgress = true
-
-            when (operation) {
-                is GattOperation.WriteDescriptor -> {
-                    val callbackKey = "${operation.deviceId}:${operation.descriptor.uuid}"
-                    descriptorWriteCallbacks[callbackKey] = { success, error ->
-                        synchronized(gattOperationLock) {
-                            isGattOperationInProgress = false
-                        }
-                        operation.callback(success, error)
-                    }
-
-                    operation.descriptor.value = operation.value
-                    val success = operation.gatt.writeDescriptor(operation.descriptor)
-                    if (!success) {
-                        descriptorWriteCallbacks.remove(callbackKey)
-                        synchronized(gattOperationLock) {
-                            isGattOperationInProgress = false
-                        }
-                        operation.callback(false, "Failed to initiate descriptor write")
-                        // Try next operation
-                        processNextGattOperation()
-                    }
-                }
-            }
-        }
     }
 
     override fun setRestoreStateCallback(callback: (restoredPeripherals: Array<BLEDevice>) -> Unit) {
-        restoreStateCallback = { devices -> callback(devices.toTypedArray()) }
-        return
+        // iOS only (CoreBluetooth state restoration); Android has no equivalent.
     }
 
-    // iOS-only method, no-op on Android
     override fun iosLazyInit() {
+        // iOS only.
     }
 
-    // Scanning operations
-    override fun startScan(filter: com.margelo.nitro.co.zyke.ble.ScanFilter, callback: (device: Variant_NullType_BLEDevice?, error: Variant_NullType_String?) -> Unit) {
-        try {
-            initializeBluetoothIfNeeded()
-            val adapter = bluetoothAdapter ?: return
-            
-            if (!adapter.isEnabled) {
-                return
-            }
-            
-            if (isCurrentlyScanning) {
-                return
-            }
-            
-            // Clear discovered devices for fresh scan session
-            discoveredDevicesInCurrentScan.clear()
-            
-            // Initialize scanner
-            bleScanner = adapter.bluetoothLeScanner ?: return
-            deviceFoundCallback = callback
-            
-            // Create scan callback
-            scanCallback = object : ScanCallback() {
-                override fun onScanResult(callbackType: Int, result: ScanResult) {
-                    val device = createBLEDeviceFromScanResult(result)
-                    
-                    // Apply RSSI threshold filtering
-                    if (device.rssi < filter.rssiThreshold) {
-                        return
-                    }
-                    
-                    // Apply application-level duplicate filtering if needed
-                    if (!filter.allowDuplicates) {
-                        if (discoveredDevicesInCurrentScan.contains(device.id)) {
-                            return // Skip duplicate
-                        }
-                        discoveredDevicesInCurrentScan.add(device.id)
-                    }
-                    
-                    callback(Variant_NullType_BLEDevice.create(device), null)
-                }
-                
-                override fun onBatchScanResults(results: MutableList<ScanResult>) {
-                    results.forEach { result ->
-                        val device = createBLEDeviceFromScanResult(result)
-                        
-                        // Apply RSSI threshold filtering
-                        if (device.rssi < filter.rssiThreshold) {
-                            return@forEach
-                        }
-                        
-                        // Apply application-level duplicate filtering if needed
-                        if (!filter.allowDuplicates) {
-                            if (discoveredDevicesInCurrentScan.contains(device.id)) {
-                                return@forEach // Skip duplicate
-                            }
-                            discoveredDevicesInCurrentScan.add(device.id)
-                        }
-                        
-                        callback(Variant_NullType_BLEDevice.create(device), null)
-                    }
-                }
-                
-                override fun onScanFailed(errorCode: Int) {
-                    val errorMessage = when (errorCode) {
-                        ScanCallback.SCAN_FAILED_ALREADY_STARTED -> "Scan already started"
-                        ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "App registration failed"
-                        ScanCallback.SCAN_FAILED_FEATURE_UNSUPPORTED -> "Feature unsupported"
-                        ScanCallback.SCAN_FAILED_INTERNAL_ERROR -> "Internal error"
-                        ScanCallback.SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES -> "Out of hardware resources"
-                        ScanCallback.SCAN_FAILED_SCANNING_TOO_FREQUENTLY -> "Scanning too frequently"
-                        else -> "Scan failed with error code: $errorCode"
-                    }
-                    callback(null, Variant_NullType_String.create(errorMessage))
-                    stopScan()
-                }
-            }
-            
-            // Create scan filters and settings
-            val scanFilters = createAndroidScanFilters(filter)
-            val scanMode = when (filter.androidScanMode) {
-                AndroidScanMode.LOWLATENCY -> ScanSettings.SCAN_MODE_LOW_LATENCY
-                AndroidScanMode.LOWPOWER -> ScanSettings.SCAN_MODE_LOW_POWER
-                AndroidScanMode.BALANCED -> ScanSettings.SCAN_MODE_BALANCED
-                AndroidScanMode.OPPORTUNISTIC -> ScanSettings.SCAN_MODE_OPPORTUNISTIC
-            }
-            
-            val scanSettingsBuilder = ScanSettings.Builder()
-                .setScanMode(scanMode)
-                .setReportDelay(0) // Report each advertisement individually
-            
-            // Always use CALLBACK_TYPE_ALL_MATCHES for application-level duplicate filtering
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                scanSettingsBuilder.setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-            }
-            
-            val scanSettings = scanSettingsBuilder.build()
-            
-            // Start scanning
-            bleScanner?.startScan(scanFilters, scanSettings, scanCallback)
-            isCurrentlyScanning = true
-            
-        } catch (e: SecurityException) {
-            isCurrentlyScanning = false
-        } catch (e: Exception) {
-            isCurrentlyScanning = false
-        }
+    // Scanning
+
+    override fun startScan(filter: ScanFilter, callback: (device: BLEDevice?, error: BleError?) -> Unit) {
+        async({ callback(null, it) }) { beginScan(filter, callback) }
     }
 
-    override fun stopScan(): Boolean {
-        return try {
-            if (scanCallback != null && isCurrentlyScanning) {
-                bleScanner?.stopScan(scanCallback)
-            }
-            isCurrentlyScanning = false
-            scanCallback = null
-            deviceFoundCallback = null
-            bleScanner = null
-            discoveredDevicesInCurrentScan.clear() // Clear discovered devices for next scan session
-            true
-        } catch (e: Exception) {
-            isCurrentlyScanning = false
-            scanCallback = null
-            deviceFoundCallback = null
-            bleScanner = null
-            discoveredDevicesInCurrentScan.clear()
-            false
-        }
-    }
+    /** Returns whether a scan was running. No callback of it runs after this returns. */
+    override fun stopScan(): Boolean = sync(false) { stopActiveScan() }
 
-    override fun isScanning(): Boolean {
-        return isCurrentlyScanning
-    }
+    override fun isScanning(): Boolean = sync(false) { scan != null }
 
     // Device discovery
-    override fun getConnectedDevices(services: Array<String>): Array<BLEDevice> {
-        return try {
-            val bluetoothManager = appContext?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-            val connectedDevices = bluetoothManager?.getConnectedDevices(BluetoothProfile.GATT) ?: emptyList()
-            
-            connectedDevices.map { device ->
-                BLEDevice(
-                    id = device.address,
-                    name = device.name ?: "",
-                    rssi = 0.0, // RSSI not available for already connected devices
-                    manufacturerData = ManufacturerData(companyIdentifiers = emptyArray()),
-                    serviceData = ServiceData(services = emptyArray()),
-                    serviceUUIDs = emptyArray(), // Service UUIDs not available without service discovery
-                    isConnectable = true,
-                    isConnected = true
-                )
-            }.toTypedArray()
-        } catch (e: Exception) {
-            emptyArray()
-        }
+
+    /**
+     * Devices with a GATT connection to this phone, from any app. Android
+     * reports these connections without their services, so [services] can't
+     * narrow the list.
+     */
+    override fun getConnectedDevices(services: Array<String>): Array<BLEDevice> = sync(emptyArray()) {
+        val bluetooth = bluetooth() ?: return@sync emptyArray()
+        val manager = bluetooth.context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        manager.getConnectedDevices(BluetoothProfile.GATT).map { device ->
+            BLEDevice(
+                id = device.address,
+                name = deviceName(device) ?: "",
+                rssi = RSSI_UNAVAILABLE,
+                manufacturerData = ManufacturerData(companyIdentifiers = emptyArray()),
+                serviceData = ServiceData(services = emptyArray()),
+                serviceUUIDs = emptyArray(),
+                isConnectable = true,
+                isConnected = true,
+            )
+        }.toTypedArray()
     }
 
     // Connection management
+
+    /**
+     * Connect semantics:
+     * - device connected through this manager: succeeds at once and installs
+     *   [disconnectCallback] in place of the previous one (spec)
+     * - a connect to the device is still pending: fails with
+     *   DeviceAlreadyConnected and leaves the pending one alone (ble-plx's code
+     *   for a second connect: RxAndroidBle's BleAlreadyConnectedException)
+     * - a disconnect() of the device still waits for the link to go down: that
+     *   link is closed now and a fresh one opened, so a stale BluetoothGatt never
+     *   lingers next to the new one
+     */
     override fun connect(
         deviceId: String,
-        callback: (success: Boolean, deviceId: String, error: String) -> Unit,
-        disconnectCallback: ((deviceId: String, interrupted: Boolean, error: String) -> Unit)?,
-        autoConnectAndroid: Boolean?
+        options: ConnectOptions,
+        callback: (error: BleError?) -> Unit,
+        disconnectCallback: ((deviceId: String, interrupted: Boolean, error: BleError?) -> Unit)?,
     ) {
-        try {
-            initializeBluetoothIfNeeded()
-            val adapter = bluetoothAdapter
-            if (adapter == null) {
-                callback(false, deviceId, "Bluetooth not available")
-                return
+        async(callback) {
+            val existing = links[deviceId]
+            when {
+                existing == null -> Unit
+                existing.isConnecting -> return@async callback(
+                    bleError(BleErrorCode.DEVICEALREADYCONNECTED, "A connection to $deviceId is already pending")
+                )
+                existing.isConnected -> {
+                    existing.disconnectCallback = disconnectCallback
+                    return@async callback(null)
+                }
+                else -> existing.finishDisconnect()
             }
-            
-            val device = adapter.getRemoteDevice(deviceId)
-            if (device == null) {
-                callback(false, deviceId, "Device not found")
-                return
+            val bluetooth = bluetooth() ?: return@async callback(unsupportedError())
+            if (!bluetooth.adapter.isEnabled) return@async callback(poweredOffError("connect to $deviceId"))
+            if (!BluetoothAdapter.checkBluetoothAddress(deviceId)) {
+                return@async callback(invalidIdentifiersError(deviceId))
             }
-            
-            // Store callbacks for this device
-            deviceCallbacks[deviceId] = DeviceCallbacks(
+            val link = GattConnection(
+                deviceId = deviceId,
+                device = bluetooth.adapter.getRemoteDevice(deviceId),
+                handler = handler,
+                refreshGatt = options.refreshGatt == true,
                 connectCallback = callback,
-                disconnectCallback = disconnectCallback
+                disconnectCallback = disconnectCallback,
+                onClosed = { closed -> if (links[closed.deviceId] === closed) links.remove(closed.deviceId) },
             )
-            
-            // Create GATT callback
-            val gattCallback = createGattCallback(deviceId)
-            
-            // Connect to device
-            val context = appContext
-            if (context != null) {
-                val autoConnect = autoConnectAndroid ?: false
-                val gatt = device.connectGatt(context, autoConnect, gattCallback)
-                connectedDevices[deviceId] = gatt
-            } else {
-                callback(false, deviceId, "Context not available")
-            }
-            
-        } catch (e: SecurityException) {
-            callback(false, deviceId, "Permission denied")
-        } catch (e: Exception) {
-            callback(false, deviceId, "Connection error: ${e.message}")
+            links[deviceId] = link
+            link.open(bluetooth.context, autoConnect = options.autoConnect == true, timeoutMs = options.timeoutMs?.toLong())
         }
     }
 
-    override fun disconnect(deviceId: String, callback: (success: Boolean, error: String) -> Unit) {
-        try {
-            val gatt = connectedDevices[deviceId]
-            if (gatt != null) {
-                var pendingConnect: ((Boolean, String, String) -> Unit)? = null
-                deviceCallbacks.compute(deviceId) { _, callbacks ->
-                    pendingConnect = callbacks?.connectCallback
-                    callbacks?.copy(connectCallback = null)
-                }
-                pendingConnect?.invoke(false, deviceId, "Connection cancelled")
-                gatt.disconnect()
-                callback(true, "")
-            } else {
-                callback(false, "Device not connected")
-            }
-        } catch (e: Exception) {
-            callback(false, "Disconnect error: ${e.message}")
+    /** Fails with DeviceNotConnected when there is neither a link nor a pending connect (ble-plx). */
+    override fun disconnect(deviceId: String, callback: (error: BleError?) -> Unit) {
+        async(callback) {
+            val link = links[deviceId] ?: return@async callback(notConnectedError(deviceId))
+            link.disconnect(callback)
         }
     }
 
-    override fun isConnected(deviceId: String): Boolean {
-        val gatt = connectedDevices[deviceId] ?: return false
-        val bluetoothManager = appContext?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return false
-        val connectionState = bluetoothManager.getConnectionState(gatt.device, BluetoothProfile.GATT)
-        return connectionState == BluetoothProfile.STATE_CONNECTED
-    }
+    override fun isConnected(deviceId: String): Boolean = sync(false) { links[deviceId]?.isConnected == true }
 
-    override fun requestMTU(deviceId: String, mtu: Double): Double {
-        return try {
-            val gatt = connectedDevices[deviceId]
-            if (gatt != null) {
-                val success = gatt.requestMtu(mtu.toInt())
-                if (success) {
-                    markMtuInFlight(deviceId)
-                }
-                if (success) mtu else 0.0
-            } else {
-                0.0
-            }
-        } catch (e: Exception) {
-            0.0
+    override fun requestMTU(deviceId: String, mtu: Double, callback: (error: BleError?, mtu: Double?) -> Unit) {
+        async({ callback(it, null) }) {
+            val link = links[deviceId] ?: return@async callback(notConnectedError(deviceId), null)
+            link.requestMtu(mtu.toInt(), callback)
         }
     }
 
-    override fun requestConnectionPriority(deviceId: String, androidConnectionPriority: AndroidConnectionPriority): Boolean {
-        return try {
-            val gatt = connectedDevices[deviceId] ?: return false
-            gatt.requestConnectionPriority(mapAndroidConnectionPriority(androidConnectionPriority))
-        } catch (_: Exception) {
-            false
+    override fun requestConnectionPriority(
+        deviceId: String,
+        androidConnectionPriority: AndroidConnectionPriority,
+        callback: (error: BleError?) -> Unit,
+    ) {
+        async(callback) {
+            val link = links[deviceId] ?: return@async callback(notConnectedError(deviceId))
+            val priority = when (androidConnectionPriority) {
+                AndroidConnectionPriority.HIGH -> BluetoothGatt.CONNECTION_PRIORITY_HIGH
+                AndroidConnectionPriority.LOWPOWER -> BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
+                AndroidConnectionPriority.BALANCED -> BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+            }
+            link.requestConnectionPriority(priority, callback)
         }
     }
 
-    override fun readRSSI(deviceId: String, callback: (success: Boolean, rssi: Double, error: String) -> Unit) {
-        try {
-            val gatt = connectedDevices[deviceId]
-            if (gatt == null) {
-                callback(false, 0.0, "Device not connected")
-                return
-            }
-            
-            // Store callback for when RSSI is read
-            rssiCallbacks[deviceId] = callback
-            
-            // Initiate RSSI read
-            val success = gatt.readRemoteRssi()
-            if (!success) {
-                rssiCallbacks.remove(deviceId)
-                callback(false, 0.0, "Failed to initiate RSSI read")
-            }
-            
-        } catch (e: Exception) {
-            rssiCallbacks.remove(deviceId)
-            callback(false, 0.0, "RSSI read error: ${e.message}")
+    override fun readRSSI(deviceId: String, callback: (error: BleError?, rssi: Double?) -> Unit) {
+        async({ callback(it, null) }) {
+            val link = links[deviceId] ?: return@async callback(notConnectedError(deviceId), null)
+            link.readRssi(callback)
         }
     }
 
     // Service discovery
-    override fun discoverServices(deviceId: String, callback: (success: Boolean, error: String) -> Unit) {
-        try {
-            val gatt = connectedDevices[deviceId]
-            if (gatt != null) {
-                val callbacks = deviceCallbacks[deviceId]
-                if (callbacks != null) {
-                    // Store the callback for when service discovery completes
-                    callbacks.serviceDiscoveryCallback = callback
-                    
-                    runOrDeferDiscovery(deviceId) {
-                        // Start service discovery
-                        val success = gatt.discoverServices()
-                        if (!success) {
-                            // Clear callback and report failure immediately
-                            callbacks.serviceDiscoveryCallback = null
-                            callback(false, "Failed to start service discovery")
-                        }
-                        // If success, the callback will be invoked in onServicesDiscovered
-                    }
-                } else {
-                    callback(false, "Device callback not found")
-                }
-            } else {
-                callback(false, "Device not connected")
-            }
-        } catch (e: Exception) {
-            callback(false, "Service discovery error: ${e.message}")
+
+    override fun discoverServices(deviceId: String, callback: (error: BleError?) -> Unit) {
+        async(callback) {
+            val link = links[deviceId] ?: return@async callback(notConnectedError(deviceId))
+            link.discoverServices(callback)
         }
     }
 
-    override fun discoverServicesWithCharacteristics(deviceId: String, callback: (success: Boolean, error: String) -> Unit) {
-        // On Android, discoverServices() already discovers characteristics automatically.
-        // Delegate directly to discoverServices.
+    /** Android's service discovery includes the characteristics. */
+    override fun discoverServicesWithCharacteristics(deviceId: String, callback: (error: BleError?) -> Unit) =
         discoverServices(deviceId, callback)
+
+    override fun getServices(deviceId: String): Array<String> = sync(emptyArray()) {
+        links[deviceId]?.services() ?: emptyArray()
     }
 
-    override fun getServices(deviceId: String): Array<String> {
-        return try {
-            val gatt = connectedDevices[deviceId]
-            gatt?.services?.map { service ->
-                service.uuid.toString()
-            }?.toTypedArray() ?: emptyArray()
-        } catch (e: Exception) {
-            emptyArray()
-        }
-    }
-
-    override fun getCharacteristics(deviceId: String, serviceId: String): Array<String> {
-        return try {
-            val gatt = connectedDevices[deviceId]
-            val service = gatt?.getService(UUID.fromString(serviceId))
-            service?.characteristics?.map { characteristic ->
-                characteristic.uuid.toString()
-            }?.toTypedArray() ?: emptyArray()
-        } catch (e: Exception) {
-            emptyArray()
-        }
+    override fun getCharacteristics(deviceId: String, serviceId: String): Array<String> = sync(emptyArray()) {
+        links[deviceId]?.characteristics(UUID.fromString(serviceId)) ?: emptyArray()
     }
 
     // Characteristic operations
+
     override fun readCharacteristic(
         deviceId: String,
         serviceId: String,
         characteristicId: String,
-        callback: (success: Boolean, data: ArrayBuffer, error: String) -> Unit
+        callback: (error: BleError?, data: ArrayBuffer?) -> Unit,
     ) {
-        try {
-            val gatt = connectedDevices[deviceId]
-            if (gatt == null) {
-                callback(false, ArrayBuffer.allocate(0), "Device not connected")
-                return
-            }
-
-            val service = gatt.getService(UUID.fromString(serviceId))
-            if (service == null) {
-                callback(false, ArrayBuffer.allocate(0), "Service not found")
-                return
-            }
-
-            val characteristic = service.getCharacteristic(UUID.fromString(characteristicId))
-            if (characteristic == null) {
-                callback(false, ArrayBuffer.allocate(0), "Characteristic not found")
-                return
-            }
-
-            // Store callback for when read completes in onCharacteristicRead
-            val callbackKey = "$deviceId:$characteristicId"
-            readCallbacks[callbackKey] = callback
-
-            // Initiate the read operation
-            val success = gatt.readCharacteristic(characteristic)
-            if (!success) {
-                // Remove callback and report failure immediately
-                readCallbacks.remove(callbackKey)
-                callback(false, ArrayBuffer.allocate(0), "Failed to initiate read operation")
-            }
-            // If success, wait for onCharacteristicRead callback
-
-        } catch (e: Exception) {
-            callback(false, ArrayBuffer.allocate(0), "Read error: ${e.message}")
+        async({ callback(it, null) }) {
+            val key = characteristicKey(serviceId, characteristicId)
+                ?: return@async callback(invalidIdentifiersError(serviceId, characteristicId), null)
+            val link = links[deviceId] ?: return@async callback(notConnectedError(deviceId), null)
+            link.read(key, callback)
         }
     }
 
@@ -938,60 +287,20 @@ class BleNitroBleManager : HybridNativeBleNitroSpec() {
         characteristicId: String,
         data: ArrayBuffer,
         withResponse: Boolean,
-        callback: (success: Boolean, responseData: ArrayBuffer, error: String) -> Unit
+        callback: (error: BleError?, responseData: ArrayBuffer?) -> Unit,
     ) {
-        try {
-            val gatt = connectedDevices[deviceId]
-            if (gatt == null) {
-                callback(false, ArrayBuffer.allocate(0), "Device not connected")
-                return
-            }
-            
-            val service = gatt.getService(UUID.fromString(serviceId))
-            if (service == null) {
-                callback(false, ArrayBuffer.allocate(0), "Service not found")
-                return
-            }
-            
-            val characteristic = service.getCharacteristic(UUID.fromString(characteristicId))
-            if (characteristic == null) {
-                callback(false, ArrayBuffer.allocate(0), "Characteristic not found")
-                return
-            }
-            
-            // Convert ArrayBuffer to byte array using proper Nitro API
-            val byteBuffer = data.getBuffer(copyIfNeeded = true)
-            val bytes = ByteArray(byteBuffer.remaining())
-            byteBuffer.get(bytes)
-            
-            characteristic.value = bytes
-            characteristic.writeType = if (withResponse) {
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            } else {
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            }
-            
-            if (withResponse) {
-                // Store callback for when response comes back
-                val callbackKey = "$deviceId:$characteristicId"
-                writeCallbacks[callbackKey] = callback
-            }
-            
-            val success = gatt.writeCharacteristic(characteristic)
-            
-            if (!withResponse) {
-                // For no response, call callback immediately
-                callback(success, ArrayBuffer.allocate(0), if (success) "" else "Write operation failed")
-            } else if (!success) {
-                // If write initiation failed, remove callback and notify
-                val callbackKey = "$deviceId:$characteristicId"
-                writeCallbacks.remove(callbackKey)
-                callback(false, ArrayBuffer.allocate(0), "Write operation failed to initiate")
-            }
-            // If withResponse and success, wait for onCharacteristicWrite
-            
-        } catch (e: Exception) {
-            callback(false, ArrayBuffer.allocate(0), "Write error: ${e.message}")
+        // Copied here, on the calling thread: a buffer from JS is valid only
+        // during this call, and the caller may reuse it once the call returns.
+        val source = data.getBuffer(false).duplicate()
+        // Buffer.rewind(): ByteBuffer's covariant override is newer than minSdk.
+        (source as java.nio.Buffer).rewind()
+        val value = ByteArray(source.remaining())
+        source.get(value)
+        async({ callback(it, null) }) {
+            val key = characteristicKey(serviceId, characteristicId)
+                ?: return@async callback(invalidIdentifiersError(serviceId, characteristicId), null)
+            val link = links[deviceId] ?: return@async callback(notConnectedError(deviceId), null)
+            link.write(key, value, withResponse, callback)
         }
     }
 
@@ -999,75 +308,14 @@ class BleNitroBleManager : HybridNativeBleNitroSpec() {
         deviceId: String,
         serviceId: String,
         characteristicId: String,
-        updateCallback: (characteristicId: String, data: ArrayBuffer) -> Unit,
-        completionCallback: (success: Boolean, error: String) -> Unit
+        updateCallback: (data: ArrayBuffer) -> Unit,
+        completionCallback: (error: BleError?) -> Unit,
     ) {
-        try {
-            val gatt = connectedDevices[deviceId]
-            if (gatt == null) {
-                completionCallback(false, "Device not connected")
-                return
-            }
-
-            val service = gatt.getService(UUID.fromString(serviceId))
-            if (service == null) {
-                completionCallback(false, "Service not found")
-                return
-            }
-
-            val characteristic = service.getCharacteristic(UUID.fromString(characteristicId))
-            if (characteristic == null) {
-                completionCallback(false, "Characteristic not found")
-                return
-            }
-
-            // Enable notifications locally
-            val success = gatt.setCharacteristicNotification(characteristic, true)
-            if (!success) {
-                completionCallback(false, "Failed to enable notifications")
-                return
-            }
-
-            val subscriptionKey = "$serviceId:$characteristicId"
-
-            val cccdValue = when (cccdSubscriptionMode(characteristic.properties)) {
-                CccdSubscriptionMode.INDICATE -> BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                CccdSubscriptionMode.NOTIFY -> BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                CccdSubscriptionMode.UNSUPPORTED -> {
-                    completionCallback(false, "Characteristic does not support notify or indicate")
-                    return
-                }
-            }
-
-            // Write to the CCCD descriptor to enable notifications or indications on the remote device.
-            // The update callback is stored only after the descriptor write succeeds
-            // so that isSubscribedToCharacteristic reflects actual BLE state.
-            val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-            if (descriptor != null) {
-                enqueueGattOperation(
-                    GattOperation.WriteDescriptor(
-                        gatt = gatt,
-                        descriptor = descriptor,
-                        value = cccdValue,
-                        deviceId = deviceId,
-                        callback = { success, error ->
-                            if (success) {
-                                val callbacks = deviceCallbacks[deviceId]
-                                callbacks?.characteristicSubscriptions?.set(subscriptionKey, updateCallback)
-                            }
-                            completionCallback(success, error)
-                        }
-                    )
-                )
-            } else {
-                // No CCCD descriptor - store callback and report success
-                val callbacks = deviceCallbacks[deviceId]
-                callbacks?.characteristicSubscriptions?.set(subscriptionKey, updateCallback)
-                completionCallback(true, "")
-            }
-
-        } catch (e: Exception) {
-            completionCallback(false, "Subscription error: ${e.message}")
+        async(completionCallback) {
+            val key = characteristicKey(serviceId, characteristicId)
+                ?: return@async completionCallback(invalidIdentifiersError(serviceId, characteristicId))
+            val link = links[deviceId] ?: return@async completionCallback(notConnectedError(deviceId))
+            link.subscribe(key, updateCallback, completionCallback)
         }
     }
 
@@ -1075,175 +323,68 @@ class BleNitroBleManager : HybridNativeBleNitroSpec() {
         deviceId: String,
         serviceId: String,
         characteristicId: String,
-        callback: (success: Boolean, error: String) -> Unit
+        callback: (error: BleError?) -> Unit,
     ) {
-        try {
-            val gatt = connectedDevices[deviceId]
-            if (gatt == null) {
-                callback(false, "Device not connected")
-                return
-            }
-
-            val service = gatt.getService(UUID.fromString(serviceId))
-            if (service == null) {
-                callback(false, "Service not found")
-                return
-            }
-
-            val characteristic = service.getCharacteristic(UUID.fromString(characteristicId))
-            if (characteristic == null) {
-                callback(false, "Characteristic not found")
-                return
-            }
-
-            // Disable notifications locally
-            val success = gatt.setCharacteristicNotification(characteristic, false)
-            if (!success) {
-                callback(false, "Failed to disable notifications")
-                return
-            }
-
-            val subscriptionKey = "$serviceId:$characteristicId"
-
-            // Write to the CCCD descriptor to disable notifications on the remote device.
-            // The subscription entry is removed only after the descriptor write succeeds,
-            // mirroring the subscribe pattern to avoid a stale-entry race when
-            // subscribe and unsubscribe are called in rapid succession.
-            val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-            if (descriptor != null) {
-                enqueueGattOperation(
-                    GattOperation.WriteDescriptor(
-                        gatt = gatt,
-                        descriptor = descriptor,
-                        value = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE,
-                        deviceId = deviceId,
-                        callback = { success, error ->
-                            if (success) {
-                                val callbacks = deviceCallbacks[deviceId]
-                                callbacks?.characteristicSubscriptions?.remove(subscriptionKey)
-                            }
-                            callback(success, error)
-                        }
-                    )
-                )
-            } else {
-                // No CCCD descriptor - remove immediately
-                val callbacks = deviceCallbacks[deviceId]
-                callbacks?.characteristicSubscriptions?.remove(subscriptionKey)
-                callback(true, "")
-            }
-
-        } catch (e: Exception) {
-            callback(false, "Unsubscription error: ${e.message}")
+        async(callback) {
+            val key = characteristicKey(serviceId, characteristicId)
+                ?: return@async callback(invalidIdentifiersError(serviceId, characteristicId))
+            val link = links[deviceId] ?: return@async callback(notConnectedError(deviceId))
+            link.unsubscribe(key, callback)
         }
     }
 
-    override fun isSubscribedToCharacteristic(
-        deviceId: String,
-        serviceId: String,
-        characteristicId: String
-    ): Boolean {
-        val callbacks = deviceCallbacks[deviceId] ?: return false
-        val subscriptionKey = "$serviceId:$characteristicId"
-        return callbacks.characteristicSubscriptions.containsKey(subscriptionKey)
-    }
+    override fun isSubscribedToCharacteristic(deviceId: String, serviceId: String, characteristicId: String): Boolean =
+        sync(false) {
+            val key = CharacteristicKey(UUID.fromString(serviceId), UUID.fromString(characteristicId))
+            links[deviceId]?.isSubscribed(key) == true
+        }
 
     // Bluetooth state management
-    override fun requestBluetoothEnable(callback: (success: Boolean, error: String) -> Unit) {
-        try {
-            initializeBluetoothIfNeeded()
-            val adapter = bluetoothAdapter
-            if (adapter == null) {
-                callback(false, "Bluetooth not supported on this device")
-                return
-            }
-            
-            if (adapter.isEnabled) {
-                callback(true, "")
-                return
-            }
-            
-            // Request user to enable Bluetooth
+
+    /** Completes once Android's enable dialog was requested, not when the user answered it. */
+    override fun requestBluetoothEnable(callback: (error: BleError?) -> Unit) {
+        async(callback) {
+            val bluetooth = bluetooth() ?: return@async callback(unsupportedError())
+            if (bluetooth.adapter.isEnabled) return@async callback(null)
+            val intent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             try {
-                val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
-                appContext?.let { ctx ->
-                    enableBtIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    ctx.startActivity(enableBtIntent)
-                    callback(true, "Bluetooth enable request sent")
-                } ?: callback(false, "Context not available")
-            } catch (securityException: SecurityException) {
-                callback(false, "Permission denied: Cannot request Bluetooth enable. Please check app permissions.")
+                bluetooth.context.startActivity(intent)
+            } catch (e: SecurityException) {
+                return@async callback(unauthorizedError("Requesting Bluetooth enable", e))
+            } catch (e: ActivityNotFoundException) {
+                return@async callback(bleError(BleErrorCode.BLUETOOTHSTATECHANGEFAILED, "No activity handles the Bluetooth enable request"))
             }
-            
-        } catch (e: Exception) {
-            callback(false, "Error requesting Bluetooth enable: ${e.message}")
+            callback(null)
         }
     }
 
-    override fun state(): BLEState {
-        // Check permissions first
-        if (!hasBluetoothPermissions()) {
-            return BLEState.UNAUTHORIZED
+    /**
+     * Like ble-plx, the state reflects the adapter only. Missing runtime
+     * permissions surface as BluetoothUnauthorized errors of the operations that
+     * need them: granting one later changes no adapter state, so a state that
+     * depended on it would go stale.
+     */
+    override fun state(): BLEState = sync(BLEState.UNKNOWN) {
+        val bluetooth = bluetooth() ?: return@sync BLEState.UNSUPPORTED
+        if (!bluetooth.context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
+            return@sync BLEState.UNSUPPORTED
         }
-        
-        initializeBluetoothIfNeeded()
-        val adapter = bluetoothAdapter ?: return BLEState.UNSUPPORTED
-        
-        return try {
-            bluetoothStateToBlEState(adapter.state)
-        } catch (securityException: SecurityException) {
+        try {
+            adapterStateToBleState(bluetooth.adapter.state)
+        } catch (e: SecurityException) {
             BLEState.UNAUTHORIZED
         }
     }
 
-    override fun subscribeToStateChange(stateCallback: (state: BLEState) -> Unit): OperationResult {
-        try {
-            val context = appContext ?: return OperationResult(success = false, error = "Context not available")
-            
-            // Unsubscribe from any existing subscription
-            unsubscribeFromStateChange()
-            
-            // Store the callback
-            this.stateCallback = stateCallback
-            
-            // Create and register broadcast receiver
-            bluetoothStateReceiver = createBluetoothStateReceiver()
-            val intentFilter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(bluetoothStateReceiver, intentFilter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                context.registerReceiver(bluetoothStateReceiver, intentFilter)
-            }
-            
-            return OperationResult(success = true, error = null)
-        } catch (e: Exception) {
-            return OperationResult(success = false, error = "Error subscribing to state changes: ${e.message}")
-        }
+    /** One subscriber; a new subscription replaces the previous one. */
+    override fun subscribeToStateChange(stateCallback: (state: BLEState) -> Unit): OperationResult = sync(destroyedResult()) {
+        this.stateCallback = stateCallback
+        OperationResult(success = true, error = null)
     }
 
-    override fun unsubscribeFromStateChange(): OperationResult {
-        try {
-            // Clear the callback
-            this.stateCallback = null
-            
-            // Unregister broadcast receiver if it exists
-            bluetoothStateReceiver?.let { receiver ->
-                val context = appContext
-                if (context != null) {
-                    try {
-                        context.unregisterReceiver(receiver)
-                    } catch (e: IllegalArgumentException) {
-                        // Receiver was not registered, ignore
-                    }
-                }
-                bluetoothStateReceiver = null
-            }
-            
-            return OperationResult(success = true, error = null)
-        } catch (e: Exception) {
-            return OperationResult(success = false, error = "Error unsubscribing from state changes: ${e.message}")
-        }
+    override fun unsubscribeFromStateChange(): OperationResult = sync(destroyedResult()) {
+        stateCallback = null
+        OperationResult(success = true, error = null)
     }
 
     override fun openSettings(): Promise<Unit> {
@@ -1259,5 +400,318 @@ class BleNitroBleManager : HybridNativeBleNitroSpec() {
             promise.reject(Exception("Error opening Bluetooth settings: ${e.message}"))
         }
         return promise
+    }
+
+    /**
+     * Stops the scan (its callback gets nothing more), closes every link
+     * (connected links get their disconnect event with interrupted = false),
+     * fails every pending operation with BluetoothManagerDestroyed, unregisters
+     * the adapter state receiver and ends the handler thread. Idempotent.
+     */
+    override fun destroy() {
+        sync<Unit>(Unit) {
+            destroyed = true
+            stopActiveScan()
+            links.values.toList().forEach { it.destroy() }
+            bluetooth?.context?.unregisterReceiver(adapterStateReceiver)
+            stateCallback = null
+            // Lets the tasks posted before this one run (they see `destroyed` and
+            // fail with BluetoothManagerDestroyed); delayed timeouts are dropped.
+            thread.quitSafely()
+        }
+    }
+
+    // Handler thread plumbing
+
+    /**
+     * Runs [block] on the handler thread, later. When the manager is destroyed,
+     * [onDestroyed] gets BluetoothManagerDestroyed instead: on the handler thread
+     * while it still runs, on the calling thread once it ended.
+     */
+    private inline fun async(crossinline onDestroyed: (BleError) -> Unit, crossinline block: () -> Unit) {
+        val posted = handler.post { if (destroyed) onDestroyed(destroyedError()) else block() }
+        if (!posted) onDestroyed(destroyedError())
+    }
+
+    /**
+     * Runs [block] on the handler thread and returns its result, blocking the
+     * caller meanwhile (inline when called on the handler thread). Exceptions
+     * of [block] are rethrown to the caller. [ifDestroyed] is the result once
+     * the manager is destroyed.
+     */
+    private fun <T> sync(ifDestroyed: T, block: () -> T): T {
+        if (Looper.myLooper() === thread.looper) return if (destroyed) ifDestroyed else block()
+        val task = FutureTask(Callable { if (destroyed) ifDestroyed else block() })
+        if (!handler.post(task)) return ifDestroyed
+        try {
+            return task.get()
+        } catch (e: ExecutionException) {
+            throw e.cause ?: e
+        }
+    }
+
+    private fun destroyedResult() = OperationResult(success = false, error = destroyedError().message)
+
+    /**
+     * The adapter, resolved on first use (registering the adapter state receiver
+     * then). Null when the device has no Bluetooth adapter, or no app context
+     * could be found.
+     */
+    private fun bluetooth(): Bluetooth? {
+        bluetooth?.let { return it }
+        val context = appContext ?: currentApplication()?.also { setContext(it) } ?: return null
+        val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter ?: return null
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Not exported: the system's broadcasts still arrive, other apps' don't.
+            context.registerReceiver(adapterStateReceiver, filter, null, handler, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(adapterStateReceiver, filter, null, handler)
+        }
+        return Bluetooth(context, adapter).also { bluetooth = it }
+    }
+
+    /** The Application via ActivityThread, for when BleNitroPackage hasn't set the context. */
+    @SuppressLint("PrivateApi", "DiscouragedPrivateApi")
+    private fun currentApplication(): Context? = try {
+        Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null) as? Context
+    } catch (e: ReflectiveOperationException) {
+        Log.e(TAG, "No app context: BleNitroPackage didn't set one and ActivityThread.currentApplication() is unavailable", e)
+        null
+    }
+
+    /**
+     * Bluetooth turning off drops every link (pending operations fail, the
+     * gatts are closed, connected links get their disconnect event with
+     * interrupted = true) and ends the scan with BluetoothPoweredOff.
+     */
+    private fun onAdapterStateChanged(adapterState: Int) {
+        if (destroyed) return
+        stateCallback?.invoke(adapterStateToBleState(adapterState))
+        if (adapterState != BluetoothAdapter.STATE_TURNING_OFF && adapterState != BluetoothAdapter.STATE_OFF) return
+        scan?.let { active ->
+            scan = null
+            active.callback(null, bleError(BleErrorCode.BLUETOOTHPOWEREDOFF, "The scan stopped: Bluetooth turned off"))
+        }
+        links.values.toList().forEach { it.onBluetoothOff() }
+    }
+
+    // Scanning internals
+
+    /**
+     * Scan rules:
+     * - one scan at a time; starting one replaces the running one
+     * - a scan that can't start reports why through its callback: Bluetooth off
+     *   or missing, permission missing, location services off where Android then
+     *   delivers no results, an invalid service UUID, Android's start throttle,
+     *   or the OS's scan error code
+     * - allowDuplicates false: each device is reported once per scan
+     * - rssiThreshold: weaker results are dropped; absent, nothing is
+     */
+    private fun beginScan(filter: ScanFilter, callback: (device: BLEDevice?, error: BleError?) -> Unit) {
+        stopActiveScan()
+        val bluetooth = bluetooth() ?: return callback(null, unsupportedError())
+        if (!bluetooth.adapter.isEnabled) return callback(null, poweredOffError("scan"))
+        missingScanPermission(bluetooth.context)?.let { permission ->
+            return callback(null, bleError(BleErrorCode.BLUETOOTHUNAUTHORIZED, "Cannot scan: $permission is not granted"))
+        }
+        if (locationServicesRequired(bluetooth.context) && !locationServicesEnabled(bluetooth.context)) {
+            return callback(
+                null,
+                bleError(BleErrorCode.LOCATIONSERVICESDISABLED, "Cannot scan: location services are off, and Android delivers no scan results to this app without them"),
+            )
+        }
+        val serviceUuids = try {
+            filter.serviceUUIDs.map { ParcelUuid.fromString(it) }
+        } catch (e: IllegalArgumentException) {
+            return callback(null, invalidIdentifiersError(*filter.serviceUUIDs))
+        }
+        // Null while the adapter is not on.
+        val scanner = bluetooth.adapter.bluetoothLeScanner ?: return callback(null, poweredOffError("scan"))
+        val now = SystemClock.elapsedRealtime()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            val wait = scanThrottle.delayBeforeNextStart(now)
+            if (wait > 0) {
+                return callback(null, bleError(BleErrorCode.SCANSTARTFAILED, "Cannot scan: Android allows 5 scan starts per 30 s; retry in $wait ms"))
+            }
+        }
+        val active = ActiveScan(filter, callback)
+        try {
+            scanner.startScan(scanFilters(serviceUuids), scanSettings(filter.androidScanMode), active.osCallback)
+        } catch (e: SecurityException) {
+            return callback(null, unauthorizedError("Scanning", e))
+        } catch (e: IllegalStateException) {
+            // BluetoothLeScanner's answer when the adapter turned off since the check above.
+            return callback(null, poweredOffError("scan"))
+        }
+        scanThrottle.recordStart(now)
+        scan = active
+    }
+
+    /** Stops the running scan; returns whether one was running. */
+    private fun stopActiveScan(): Boolean {
+        val active = scan ?: return false
+        scan = null
+        val adapter = bluetooth?.adapter ?: return true
+        // While the adapter is not on, the OS has stopped every scan already and
+        // BluetoothLeScanner refuses calls.
+        if (adapter.state != BluetoothAdapter.STATE_ON) return true
+        try {
+            adapter.bluetoothLeScanner?.stopScan(active.osCallback)
+        } catch (e: IllegalStateException) {
+            Log.i(TAG, "Bluetooth turned off while the scan stopped; the OS ended the scan itself")
+        }
+        return true
+    }
+
+    private fun scanFilters(serviceUuids: List<ParcelUuid>): List<android.bluetooth.le.ScanFilter> =
+        if (serviceUuids.isEmpty()) {
+            // An empty filter matches every device.
+            listOf(android.bluetooth.le.ScanFilter.Builder().build())
+        } else {
+            serviceUuids.map { android.bluetooth.le.ScanFilter.Builder().setServiceUuid(it).build() }
+        }
+
+    private fun scanSettings(mode: AndroidScanMode): ScanSettings = ScanSettings.Builder()
+        .setScanMode(
+            when (mode) {
+                AndroidScanMode.LOWLATENCY -> ScanSettings.SCAN_MODE_LOW_LATENCY
+                AndroidScanMode.LOWPOWER -> ScanSettings.SCAN_MODE_LOW_POWER
+                AndroidScanMode.BALANCED -> ScanSettings.SCAN_MODE_BALANCED
+                AndroidScanMode.OPPORTUNISTIC -> ScanSettings.SCAN_MODE_OPPORTUNISTIC
+            }
+        )
+        // Every advertisement, each reported at once: duplicates are filtered here.
+        .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+        .setReportDelay(0)
+        .build()
+
+    /** One startScan call; results of a stopped or replaced scan are recognized by identity and dropped. */
+    private inner class ActiveScan(
+        private val filter: ScanFilter,
+        val callback: (device: BLEDevice?, error: BleError?) -> Unit,
+    ) {
+        private val reported = HashSet<String>()
+
+        // The OS calls these on the main thread.
+        val osCallback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                handler.post { if (scan === this@ActiveScan) onResult(result) }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                handler.post {
+                    if (scan === this@ActiveScan) {
+                        scan = null
+                        callback(null, scanFailedError(errorCode))
+                    }
+                }
+            }
+        }
+
+        private fun onResult(result: ScanResult) {
+            val threshold = filter.rssiThreshold
+            if (threshold != null && result.rssi < threshold) return
+            if (!filter.allowDuplicates && !reported.add(result.device.address)) return
+            callback(result.toBLEDevice(), null)
+        }
+    }
+
+    private fun ScanResult.toBLEDevice(): BLEDevice {
+        val record = scanRecord
+        val manufacturerData = record?.manufacturerSpecificData
+        val manufacturerEntries = if (manufacturerData == null) {
+            emptyArray()
+        } else {
+            // Company identifier (decimal) and the payload after it.
+            Array(manufacturerData.size()) { i ->
+                ManufacturerDataEntry(id = manufacturerData.keyAt(i).toString(), data = ArrayBuffer.copy(manufacturerData.valueAt(i)))
+            }
+        }
+        val serviceEntries = record?.serviceData?.map { (uuid, data) ->
+            ServiceDataEntry(uuid = uuid.toString(), data = ArrayBuffer.copy(data))
+        }?.toTypedArray() ?: emptyArray()
+        return BLEDevice(
+            id = device.address,
+            name = deviceName(device) ?: "",
+            rssi = rssi.toDouble(),
+            manufacturerData = ManufacturerData(companyIdentifiers = manufacturerEntries),
+            serviceData = ServiceData(services = serviceEntries),
+            serviceUUIDs = record?.serviceUuids?.map { it.toString() }?.toTypedArray() ?: emptyArray(),
+            // Before API 26 Android doesn't tell; legacy advertisements are mostly connectable.
+            isConnectable = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) isConnectable else true,
+            isConnected = false,
+        )
+    }
+
+    /** BluetoothDevice.getName(), as ble-plx reports it; null when unknown or without BLUETOOTH_CONNECT (API 31+). */
+    private fun deviceName(device: BluetoothDevice): String? = try {
+        device.name
+    } catch (e: SecurityException) {
+        null
+    }
+
+    /**
+     * The runtime permission scanning needs that isn't granted, if any; the sets
+     * RxAndroidBle checks, by [effectiveSdk]: BLUETOOTH_SCAN from API 31, plus
+     * fine location unless BLUETOOTH_SCAN is declared neverForLocation; fine
+     * location on API 29-30; fine or coarse location before. Without them a scan
+     * fails or runs without ever delivering a result.
+     */
+    private fun missingScanPermission(context: Context): String? {
+        // Every inner list must have one granted permission.
+        val required = when {
+            effectiveSdk(context) >= Build.VERSION_CODES.S -> if (scanNeverForLocation(context)) {
+                listOf(listOf(Manifest.permission.BLUETOOTH_SCAN))
+            } else {
+                listOf(listOf(Manifest.permission.BLUETOOTH_SCAN), listOf(Manifest.permission.ACCESS_FINE_LOCATION))
+            }
+            effectiveSdk(context) >= Build.VERSION_CODES.Q -> listOf(listOf(Manifest.permission.ACCESS_FINE_LOCATION))
+            else -> listOf(listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+        }
+        val missing = required.firstOrNull { anyOf ->
+            anyOf.none { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
+        }
+        return missing?.joinToString(" or ")
+    }
+
+    /**
+     * Whether Android delivers scan results only while location services are on
+     * (RxAndroidBle's LocationServicesStatus): always before API 31 (except on
+     * Wear OS), from API 31 unless BLUETOOTH_SCAN is declared neverForLocation.
+     */
+    private fun locationServicesRequired(context: Context): Boolean {
+        if (context.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) return false
+        return !scanNeverForLocation(context)
+    }
+
+    /**
+     * Whether the app (API 31+, targeting 31+) declares BLUETOOTH_SCAN with
+     * usesPermissionFlags="neverForLocation". Read once from the manifest.
+     */
+    @Suppress("DEPRECATION")
+    private fun scanNeverForLocation(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || context.applicationInfo.targetSdkVersion < Build.VERSION_CODES.S) return false
+        scanPermissionNeverForLocation?.let { return it }
+        val info = context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
+        val index = info.requestedPermissions?.indexOf(Manifest.permission.BLUETOOTH_SCAN) ?: -1
+        val flags = info.requestedPermissionsFlags
+        val neverForLocation = index >= 0 && flags != null &&
+            (flags[index] and PackageInfo.REQUESTED_PERMISSION_NEVER_FOR_LOCATION) != 0
+        scanPermissionNeverForLocation = neverForLocation
+        return neverForLocation
+    }
+
+    private fun locationServicesEnabled(context: Context): Boolean =
+        LocationManagerCompat.isLocationEnabled(context.getSystemService(Context.LOCATION_SERVICE) as LocationManager)
+
+    /** The API level whose permission model applies: the device's, capped by the app's target. */
+    private fun effectiveSdk(context: Context): Int = min(Build.VERSION.SDK_INT, context.applicationInfo.targetSdkVersion)
+
+    /** Parses a characteristic's UUIDs; null when either isn't a UUID. */
+    private fun characteristicKey(serviceId: String, characteristicId: String): CharacteristicKey? = try {
+        CharacteristicKey(UUID.fromString(serviceId), UUID.fromString(characteristicId))
+    } catch (e: IllegalArgumentException) {
+        null
     }
 }

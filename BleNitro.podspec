@@ -29,7 +29,14 @@ Pod::Spec.new do |s|
     'OTHER_LDFLAGS' => '-lc++'
   }
 
-  # Apply Nitro autolinking
+  # Apply Nitro autolinking. It also makes the generated shared C++ headers
+  # (nitrogen/generated/shared/c++: HybridNativeBleNitroSpec.hpp and the structs
+  # and enums it uses) public headers of this pod, so a native module whose pod
+  # depends on 'BleNitro' can include them and call the spec from C++:
+  # `#include <BleNitro/HybridNativeBleNitroSpec.hpp>` always works, and plain
+  # `#include "HybridNativeBleNitroSpec.hpp"` too when pods are static libraries
+  # and the dependent pod defines no module (CocoaPods then puts
+  # Headers/Public/BleNitro on its header search path).
   load 'nitrogen/generated/ios/BleNitro+autolinking.rb'
   add_nitrogen_files(s)
 
