@@ -2,7 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import { AppState, PermissionsAndroid, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { createBle } from './src/bluetooth';
 import { useLayoutEffect, useRef, useState } from 'react';
-import { AndroidConnectionPriority, type BLEDevice, type AsyncSubscription } from 'react-native-ble-nitro';
+import { AndroidConnectionPriority, BleError, type BLEDevice, type AsyncSubscription } from 'react-native-ble-nitro';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 const HEART_RATE_SERVICE_UUID = '0000180d-0000-1000-8000-00805f9b34fb'.toLowerCase();
@@ -69,15 +69,15 @@ export default function App() {
     if (Platform.OS !== 'android') {
       return true;
     }
-    const success = await ble.instance.requestBluetoothEnable().catch((e) => {
+    try {
+      await ble.instance.requestBluetoothEnable();
+      logMessage('requestBluetoothEnable', 'ok');
+      return true;
+    } catch (e) {
       console.error(e);
-      if (e instanceof Error && e.message === 'Not supported') {
-        logMessage('requestBluetoothEnable only works on Android');
-      }
+      logMessage('requestBluetoothEnable failed', describeError(e));
       return false;
-    });
-    logMessage('requestBluetoothEnable', String(success));
-    return success;
+    }
   };
 
   const requestPermissionsAndroid = async () => {
@@ -114,7 +114,7 @@ export default function App() {
 
   const startScan = async () => {
     ble.instance.startScan({
-      serviceUUIDs: scanServiceUUIDs.replaceAll(' ', '').split(',') ?? [],
+      serviceUUIDs: scanServiceUUIDs.replaceAll(' ', '').split(',').filter((uuid) => uuid.length > 0),
       rssiThreshold: -100,
       allowDuplicates: false,
     }, (device) => {
@@ -129,7 +129,7 @@ export default function App() {
       });
     }, (error) => {
       console.error(error);
-      logMessage(`Scan error: ${error}`);
+      logMessage(`Scan error: ${describeError(error)}`);
     });
     logMessage('Scan started');
     setIsScanning(true);
@@ -171,7 +171,7 @@ export default function App() {
       setConnectedDeviceServiceUUIDs([]);
       stopScan();
       logMessage(`1 Connecting to ${deviceId}`);
-      const connectedId = await ble.instance.connect(deviceId, onDisconnected);
+      const connectedId = await ble.instance.connect(deviceId, {}, onDisconnected);
       setConnectedDeviceId(connectedId);
       checkConnection(connectedId);
       logMessage(`2 Connected to ${connectedId}`);
@@ -190,6 +190,7 @@ export default function App() {
       logMessage('Device is connected');
     } catch (e) {
       console.error(e);
+      logMessage('Connect failed', describeError(e));
     }
   };
 
@@ -219,6 +220,7 @@ export default function App() {
       logMessage('Device is connected');
     } catch (e) {
       console.error(e);
+      logMessage('Find and connect failed', describeError(e));
     }
   };
 
@@ -229,8 +231,8 @@ export default function App() {
     if (!deviceIsConnected) {
       return;
     }
+    // onDisconnected runs from the disconnect callback, with interrupted = false.
     await ble.instance.disconnect(connectedDeviceId);
-    onDisconnected(connectedDeviceId, false);
   }
 
   const readCharacteristic = (serviceId: string, characteristicId: string) => {
@@ -253,43 +255,57 @@ export default function App() {
       BATTERY_SERVICE_UUID,
       BATTERY_CHARACTERISTIC_LEVEL_UUID,
     );
-    console.log(batteryLevel);
-    logMessage('Battery Level', batteryLevel[0]);
+    logMessage('Battery Level', new Uint8Array(batteryLevel)[0]);
   };
 
   const readBodySensorLocation = async () => {
-    const [bodySensorLocation] = await readCharacteristic(
+    const [bodySensorLocation] = new Uint8Array(await readCharacteristic(
       HEART_RATE_SERVICE_UUID,
       BODY_SENSOR_LOCATION_UUID,
-    );
+    ));
     const map = ['Other', 'Chest', 'Wrist', 'Finger', 'Hand', 'Earlobe', 'Foot'];
-    const key = bodySensorLocation && map[bodySensorLocation] ? map[bodySensorLocation] : 'Unknown';
+    const key = bodySensorLocation !== undefined && map[bodySensorLocation] ? map[bodySensorLocation] : 'Unknown';
     logMessage('Body Sensor Location', key);
   }
 
-  const requestMtu = () => {
+  const requestMtu = async () => {
     if (!connectedDeviceId) {
       throw new Error('No device connected');
     }
-    const mtu = ble.instance.requestMTU(connectedDeviceId, 517);
-    logMessage('MTU', mtu);
+    try {
+      const mtu = await ble.instance.requestMTU(connectedDeviceId, 517);
+      logMessage('MTU', mtu);
+    } catch (e) {
+      logMessage('MTU request failed', describeError(e));
+    }
   };
 
-  const requestConnectionPriority = (priority: AndroidConnectionPriority) => {
+  const requestConnectionPriority = async (priority: AndroidConnectionPriority) => {
     if (!connectedDeviceId) {
       throw new Error('No device connected');
     }
-    const accepted = ble.instance.requestConnectionPriority(connectedDeviceId, priority);
-    logMessage(`Connection Priority (${priority})`, accepted ? 'accepted' : 'rejected');
+    try {
+      await ble.instance.requestConnectionPriority(connectedDeviceId, priority);
+      logMessage(`Connection Priority (${priority})`, 'accepted');
+    } catch (e) {
+      logMessage(`Connection Priority (${priority})`, describeError(e));
+    }
   };
 
-  const stringFromBytes = (bytes: number[]) => {
-    return String.fromCharCode(...bytes).replace(/\0/g, '');
+  const describeError = (e: unknown) => {
+    if (e instanceof BleError) {
+      return `${e.errorCode} ${e.message}${e.nativeStatus !== undefined ? ` (native status ${e.nativeStatus})` : ''}`;
+    }
+    return String(e);
+  };
+
+  const stringFromBytes = (value: ArrayBuffer) => {
+    return String.fromCharCode(...new Uint8Array(value)).replace(/\0/g, '');
   }
 
-  const hexFromBytes = (bytes: number[]) => {                                                                                                                                
-    return bytes.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(':');                                                                                          
-  };   
+  const hexFromBytes = (value: ArrayBuffer) => {
+    return Array.from(new Uint8Array(value), (b) => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
+  };
 
   const readFirmwareVersion = async () => {
     const fVersion = await readCharacteristic(
@@ -362,14 +378,14 @@ export default function App() {
         enableLedCommand = ble.buildCommand(0x0e, ...enableLedCommand);
         console.log('Will enable led with command:', 0x0e, enableLedCommand);
         const result = await ble.instance.writeCharacteristic(connectedDeviceId, CUSTOM_SERVICE_UUID, TX_CHAR_UUID, enableLedCommand);
-        logMessage('Led enabled', JSON.stringify(result));
+        logMessage('Led enabled', hexFromBytes(result));
         break;
       case 'disable-led':
         let disableLedCommand = [0x00, 0x1f, 0x00];
         disableLedCommand = ble.buildCommand(0x0e, ...disableLedCommand);
         console.log('Will disable led with command:', 0x0e, disableLedCommand);
         const disResult = await ble.instance.writeCharacteristic(connectedDeviceId, CUSTOM_SERVICE_UUID, TX_CHAR_UUID, disableLedCommand);
-        logMessage('Led disabled', JSON.stringify(disResult));
+        logMessage('Led disabled', hexFromBytes(disResult));
         break;
       default:
         break;
@@ -384,8 +400,8 @@ export default function App() {
       await unsubscribeRx?.();
       setBleNotificationSubscription(false);
     }
-    const sub = await ble.instance.subscribeToCharacteristic(connectedDeviceId, CUSTOM_SERVICE_UUID, RX_CHAR_UUID, (_, data) => {
-      logMessage('Received data', JSON.stringify(data));
+    const sub = await ble.instance.subscribeToCharacteristic(connectedDeviceId, CUSTOM_SERVICE_UUID, RX_CHAR_UUID, (data) => {
+      logMessage('Received data', hexFromBytes(data));
     });
     logMessage('Subscribed to notifications');
     unsubscribeRx = sub.remove;
@@ -409,13 +425,12 @@ export default function App() {
       await unsubscribeHr?.();
       setHrNotificationSubscription(false);
     }
-    const sub = await ble.instance.subscribeToCharacteristic(connectedDeviceId, HEART_RATE_SERVICE_UUID, HEART_RATE_MEASUREMENT_UUID, (_, data) => {
-      const [type, hr] = data;
+    const sub = await ble.instance.subscribeToCharacteristic(connectedDeviceId, HEART_RATE_SERVICE_UUID, HEART_RATE_MEASUREMENT_UUID, (data) => {
+      const bytes = new Uint8Array(data);
+      const [type, hr] = bytes;
       logMessage('Heart Rate', hr);
       if (type === 0) return;
       if (type === 0x10) {
-        const bytes = data;
-
         const flags = bytes[0];
         const rrPresent = (flags & 0b00010000) !== 0; // Bit4 = RR-Intervalle vorhanden
 

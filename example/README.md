@@ -3,12 +3,11 @@
 ### Getting Started
 
 ```bash
-# Run pack in ../
-cd ../ && npm pack
+# Pack the library in ../ (builds it: Nitro bindings, TypeScript, Expo plugin)
+cd .. && npm install && npm pack
 
-# Install tgz
-cd ./example && npm install ../react-native-ble-nitro/react-native-ble-nitro-*.tgz
-npm install;
+# Install the tarball in the example
+cd example && npm install ../react-native-ble-nitro-*.tgz
 
 # Run on real device!
 npm run ios -- --device "Your Device Name"
