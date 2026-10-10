@@ -1,4 +1,4 @@
-import { BLEState } from 'react-native-ble-nitro';
+import { BLEState, type Subscription } from 'react-native-ble-nitro';
 import { ble } from './bluetooth-instance';
 
 
@@ -6,20 +6,17 @@ export function createBle(opts: {
   onEnabledChange?: (enabled: boolean) => void;
 }) {
   return {
-    mount: () => {
-      const state = ble.state();
-      console.log('Initial State', state);
-      const subState = () => ble.subscribeToStateChange((state: BLEState) => {
+    /**
+     * Reports the current Bluetooth state (emitInitial) and every change to
+     * onEnabledChange. The caller removes the returned subscription when it
+     * no longer needs the updates, e.g. on unmount.
+     */
+    mount: (): Subscription => {
+      console.log('Initial State', ble.state());
+      return ble.subscribeToStateChange((state: BLEState) => {
         opts.onEnabledChange?.(state === BLEState.PoweredOn);
         console.log('State Changed', state);
       }, true);
-      let stateSub = subState();
-      stateSub.remove();
-      console.log('State Sub Removed');
-      stateSub = subState(); 
-      return {
-        stateSub,
-      }
     },
     instance: ble,
     checkSum: (data: number[]): number => {

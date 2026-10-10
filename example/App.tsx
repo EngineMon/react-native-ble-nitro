@@ -2,7 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import { AppState, PermissionsAndroid, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { createBle } from './src/bluetooth';
 import { useLayoutEffect, useRef, useState } from 'react';
-import { AndroidConnectionPriority, BleError, type BLEDevice, type AsyncSubscription } from 'react-native-ble-nitro';
+import { AndroidConnectionPriority, BleError, type BLEDevice, type AsyncSubscription, type Subscription } from 'react-native-ble-nitro';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 const HEART_RATE_SERVICE_UUID = '0000180d-0000-1000-8000-00805f9b34fb'.toLowerCase();
@@ -25,6 +25,10 @@ const PROFILE_SOFTWARE_UUID = '00002A28-0000-1000-8000-00805f9b34fb'.toLowerCase
 const PROFILE_MODEL_UUID = '00002A24-0000-1000-8000-00805f9b34fb'.toLowerCase();
 const PROFILE_SYSTEMID_UUID = '00002A23-0000-1000-8000-00805f9b34fb'.toLowerCase();
 
+// The remove() of the current subscriptions, null when there is none. Kept
+// outside React state so that callbacks created earlier (the disconnect
+// callback, onEnded) always see the current subscription, not the one of the
+// render that created them.
 let unsubscribeRx: AsyncSubscription['remove'] | null = null;
 let unsubscribeHr: AsyncSubscription['remove'] | null = null;
 
@@ -46,17 +50,22 @@ export default function App() {
   const ble = bleModule.current;
 
   useLayoutEffect(() => {
-    requestPermissionsAndroid().then(async () => {
+    let stateSubscription: Subscription | null = null;
+    let unmounted = false;
+    requestPermissionsAndroid().then(async (granted) => {
+      if (!granted) logMessage('Bluetooth permissions not granted');
       await requestBluetoothEnable();
-      ble.mount();
+      if (!unmounted) stateSubscription = ble.mount();
     });
-    const unsub = AppState.addEventListener('change', async (state) => {
-      if (state === 'active' && isEnabled === false) {
-        const isEnabled = await ble.instance.isBluetoothEnabled();
-        setIsEnabled(isEnabled);
+    const unsub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        // Synchronous; the state subscription reports later changes.
+        setIsEnabled(ble.instance.isBluetoothEnabled());
       }
     });
     return () => {
+      unmounted = true;
+      stateSubscription?.remove();
       unsub.remove();
       disconnectDevice();
       resetScannedDevices();
@@ -80,36 +89,31 @@ export default function App() {
     }
   };
 
+  /**
+   * Android 12 (API 31) and later: BLUETOOTH_SCAN and BLUETOOTH_CONNECT only.
+   * app.json sets the plugin's neverForLocation, which declares BLUETOOTH_SCAN
+   * with usesPermissionFlags="neverForLocation" and declares the location
+   * permissions only up to API 30, so requesting location there would always
+   * be denied. Android 11 and older: scanning needs ACCESS_FINE_LOCATION.
+   */
   const requestPermissionsAndroid = async () => {
     if (Platform.OS !== 'android') {
-      return true
+      return true;
     }
-    if (Platform.OS === 'android' && PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION) {
-      const apiLevel = parseInt(Platform.Version.toString(), 10);
-      logMessage(`API level: ${apiLevel}`);
-      if (apiLevel < 31) {
-        const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
-        return (
-          result === PermissionsAndroid.RESULTS.GRANTED
-        );
-      }
-      if (PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN && PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT) {
-        const result = await PermissionsAndroid.requestMultiple([
-          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-        ])
-
-        return (
-          result['android.permission.BLUETOOTH_CONNECT'] === PermissionsAndroid.RESULTS.GRANTED &&
-          result['android.permission.BLUETOOTH_SCAN'] === PermissionsAndroid.RESULTS.GRANTED &&
-          result['android.permission.ACCESS_FINE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED
-        )
-      }
-
-      logMessage('Request permissions failed');
-      throw new Error('Request permissions failed');
+    const apiLevel = parseInt(Platform.Version.toString(), 10);
+    logMessage(`API level: ${apiLevel}`);
+    if (apiLevel < 31) {
+      const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
+      return result === PermissionsAndroid.RESULTS.GRANTED;
     }
+    const result = await PermissionsAndroid.requestMultiple([
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+    ]);
+    return (
+      result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] === PermissionsAndroid.RESULTS.GRANTED &&
+      result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === PermissionsAndroid.RESULTS.GRANTED
+    );
   };
 
   const startScan = async () => {
@@ -150,12 +154,14 @@ export default function App() {
     setScanResults(devices);
   };
 
-  const onDisconnected =  async (deviceId: string, interrupted: boolean) => {
+  const onDisconnected = async (deviceId: string, interrupted: boolean) => {
     if (interrupted) {
       logMessage('Disconnected because connection was interrupted');
     } else {
       logMessage('Disconnected intentionally');
     }
+    // The link's subscriptions ended with it (their onEnded already ran);
+    // remove() on an ended subscription resolves without doing anything.
     await unlistenToBleNotifications();
     await unlistenToHrNotifications();
     checkConnection(deviceId);
@@ -175,10 +181,9 @@ export default function App() {
       setConnectedDeviceId(connectedId);
       checkConnection(connectedId);
       logMessage(`2 Connected to ${connectedId}`);
-      await ble.instance.discoverServices(connectedId);
-      logMessage(`3 Discovered services for ${connectedId}`);
+      // Discovers the services and their characteristics, then lists them.
       const servicesWithCharacteristics = await ble.instance.getServicesWithCharacteristics(connectedId);
-      logMessage(`4 Got ${servicesWithCharacteristics.length} services for ${connectedId}`);
+      logMessage(`3 Got ${servicesWithCharacteristics.length} services for ${connectedId}`);
       setConnectedDeviceServiceUUIDs(servicesWithCharacteristics.map((s) => s.uuid));
       resetScannedDevices();
       servicesWithCharacteristics.map(async (s) => {
@@ -396,12 +401,16 @@ export default function App() {
     if (!connectedDeviceId) {
       throw new Error('No device connected');
     }
-    if (bleNotificationSubscription) {
-      await unsubscribeRx?.();
-      setBleNotificationSubscription(false);
-    }
+    await unlistenToBleNotifications();
     const sub = await ble.instance.subscribeToCharacteristic(connectedDeviceId, CUSTOM_SERVICE_UUID, RX_CHAR_UUID, (data) => {
       logMessage('Received data', hexFromBytes(data));
+    }, (error) => {
+      // Ended without remove(): link lost, disconnect(), timeout or services changed.
+      logMessage('Notifications ended', describeError(error));
+      if (unsubscribeRx === sub.remove) {
+        unsubscribeRx = null;
+        setBleNotificationSubscription(false);
+      }
     });
     logMessage('Subscribed to notifications');
     unsubscribeRx = sub.remove;
@@ -409,21 +418,21 @@ export default function App() {
   };
 
   const unlistenToBleNotifications = async () => {
-    if (bleNotificationSubscription) {
-      setBleNotificationSubscription(false);
-      await unsubscribeRx?.();
-      logMessage('Unsubscribed from notifications');
-    }
+    const remove = unsubscribeRx;
+    if (!remove) return;
+    unsubscribeRx = null;
+    setBleNotificationSubscription(false);
+    await remove();
+    logMessage('Unsubscribed from notifications');
   }
 
   const listenToHrNotifications = async () => {
     if (!connectedDeviceId) {
       throw new Error('No device connected');
     }
-    if (hrNotificationSubscription) {
-      logMessage('Already listening to heart rate');
-      await unsubscribeHr?.();
-      setHrNotificationSubscription(false);
+    if (unsubscribeHr) {
+      logMessage('Already listening to heart rate, subscribing again');
+      await unlistenToHrNotifications();
     }
     const sub = await ble.instance.subscribeToCharacteristic(connectedDeviceId, HEART_RATE_SERVICE_UUID, HEART_RATE_MEASUREMENT_UUID, (data) => {
       const bytes = new Uint8Array(data);
@@ -458,6 +467,13 @@ export default function App() {
 
         logMessage('RR-Intervals', ...rrMs);
       }
+    }, (error) => {
+      // Ended without remove(): link lost, disconnect(), timeout or services changed.
+      logMessage('Heart rate ended', describeError(error));
+      if (unsubscribeHr === sub.remove) {
+        unsubscribeHr = null;
+        setHrNotificationSubscription(false);
+      }
     });
     logMessage('Subscribed to heart rate');
     unsubscribeHr = sub.remove;
@@ -465,11 +481,12 @@ export default function App() {
   };
 
   const unlistenToHrNotifications = async () => {
-    if (hrNotificationSubscription) {
-      await unsubscribeHr?.();
-      setHrNotificationSubscription(false);
-      logMessage('Unsubscribed from heart rate');
-    }
+    const remove = unsubscribeHr;
+    if (!remove) return;
+    unsubscribeHr = null;
+    setHrNotificationSubscription(false);
+    await remove();
+    logMessage('Unsubscribed from heart rate');
   };
 
   const checkSubscriptions = () => {
