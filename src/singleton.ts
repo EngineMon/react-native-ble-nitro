@@ -1,4 +1,4 @@
-import { BleNitroManager } from "./manager";
+import { BleNitroManager } from './manager';
 
 let _instance: BleNitroManager;
 

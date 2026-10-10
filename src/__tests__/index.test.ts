@@ -1,17 +1,21 @@
 import type { HybridObject, PlatformSpec } from 'react-native-nitro-modules';
 import BleNitroNativeFactory from '../specs/NativeBleNitroFactory';
 import {
-  AndroidConnectionPriority,
   AndroidScanMode,
   BLEState,
   BleError,
   BleErrorCode,
   BleNitroManager,
+  ConnectionEventType,
   type BLEDevice,
+  type ConnectionEvent,
+  type ConnectOptions,
+  type FindAndConnectOptions,
 } from '../index';
 import {
   AndroidScanMode as NativeAndroidScanMode,
   BLEState as NativeBLEState,
+  ConnectionEventType as NativeConnectionEventType,
   type BLEDevice as NativeBLEDevice,
   type BleError as NativeBleError,
   type NativeBleNitro,
@@ -37,13 +41,14 @@ function createNative(): MockNative {
     connect: jest.fn(),
     disconnect: jest.fn(),
     isConnected: jest.fn(),
+    getMtu: jest.fn(),
     requestMTU: jest.fn(),
     requestConnectionPriority: jest.fn(),
     readRSSI: jest.fn(),
     discoverServices: jest.fn(),
-    discoverServicesWithCharacteristics: jest.fn(),
     getServices: jest.fn(),
     getCharacteristics: jest.fn(),
+    getCharacteristicProperties: jest.fn(),
     readCharacteristic: jest.fn(),
     writeCharacteristic: jest.fn(),
     subscribeToCharacteristic: jest.fn(),
@@ -53,16 +58,22 @@ function createNative(): MockNative {
     state: jest.fn(),
     subscribeToStateChange: jest.fn(),
     unsubscribeFromStateChange: jest.fn(),
+    subscribeToConnectionEvents: jest.fn(),
+    unsubscribeFromConnectionEvents: jest.fn(),
     openSettings: jest.fn(),
     destroy: jest.fn(),
   };
+  // Like the native IdSource: positive, never reused.
+  let lastId = 0;
+  const nextId = () => ++lastId;
+  native.subscribeToCharacteristic.mockImplementation(nextId);
+  native.subscribeToStateChange.mockImplementation(nextId);
+  native.subscribeToConnectionEvents.mockImplementation(nextId);
   native.stopScan.mockReturnValue(true);
   native.isConnected.mockReturnValue(false);
   native.getServices.mockReturnValue([]);
   native.getCharacteristics.mockReturnValue([]);
   native.state.mockReturnValue(NativeBLEState.PoweredOn);
-  native.subscribeToStateChange.mockReturnValue({ success: true });
-  native.unsubscribeFromStateChange.mockReturnValue({ success: true });
   return native;
 }
 
@@ -87,14 +98,32 @@ function lastCall<T, Y extends unknown[]>(method: jest.MockInstance<T, Y>): Y {
   return call;
 }
 
+/** The arguments of one native registration call and the id it returned. */
+function registration<Y extends unknown[]>(method: jest.MockInstance<number, Y>, index: number): { args: Y; id: number } {
+  const args = method.mock.calls[index];
+  const result = method.mock.results[index];
+  if (!args || result?.type !== 'return') throw new Error(`The mock has no call ${index}`);
+  return { args, id: result.value };
+}
+
 function bytes(...values: number[]): ArrayBuffer {
   return new Uint8Array(values).buffer;
+}
+
+function bytesOf(buffer: ArrayBuffer): number[] {
+  return Array.from(new Uint8Array(buffer));
 }
 
 const disconnected: NativeBleError = {
   code: BleErrorCode.DeviceDisconnected,
   message: 'Device was disconnected',
   nativeStatus: 8,
+};
+
+const scanFailure: NativeBleError = {
+  code: BleErrorCode.ScanStartFailed,
+  message: 'Scanning too frequently',
+  nativeStatus: 6,
 };
 
 function nativeDevice(overrides: Partial<NativeBLEDevice> = {}): NativeBLEDevice {
@@ -112,18 +141,17 @@ function nativeDevice(overrides: Partial<NativeBLEDevice> = {}): NativeBLEDevice
 }
 
 describe('errors', () => {
-  test('a failed operation rejects with a BleError carrying the code, the native status and the device', async () => {
+  test('a failed operation rejects with a BleError carrying the code, the native status and the canonical device id', async () => {
     const ble = new BleNitroManager();
-    const read = ble.readCharacteristic('dev-1', '180f', '2a19');
+    const read = ble.readCharacteristic('aa:bb:cc:dd:ee:ff', '180f', '2a19');
     lastCall(native.readCharacteristic)[3](disconnected, undefined);
 
     await expect(read).rejects.toBeInstanceOf(BleError);
     await expect(read).rejects.toMatchObject({
       name: 'BleError',
       errorCode: BleErrorCode.DeviceDisconnected,
-      message: 'Device was disconnected',
       nativeStatus: 8,
-      deviceId: 'dev-1',
+      deviceId: 'AA:BB:CC:DD:EE:FF',
     });
   });
 
@@ -140,7 +168,7 @@ describe('errors', () => {
     await expect(ble.disconnect('dev-1')).rejects.toMatchObject({
       errorCode: BleErrorCode.UnknownError,
       message: 'JNI exception',
-      deviceId: 'dev-1',
+      deviceId: 'DEV-1',
       cause: thrown,
     });
     expect(() => ble.isConnected('dev-1')).toThrow(BleError);
@@ -157,26 +185,87 @@ describe('errors', () => {
   });
 });
 
-describe('connection', () => {
-  test('connect goes to native even when the device is connected, and reports disconnects with a BleError', async () => {
+describe('GATT UUIDs', () => {
+  test.each([
+    ['180d', '0000180d-0000-1000-8000-00805f9b34fb'],
+    ['180D', '0000180d-0000-1000-8000-00805f9b34fb'],
+    ['0000180D', '0000180d-0000-1000-8000-00805f9b34fb'],
+    ['FEEDBEEF', 'feedbeef-0000-1000-8000-00805f9b34fb'],
+    ['A1B2C3D400014E5F8A9B0C1D2E3F4A5B', 'a1b2c3d4-0001-4e5f-8a9b-0c1d2e3f4a5b'],
+    ['A1B2C3D4-0001-4E5F-8A9B-0C1D2E3F4A5B', 'a1b2c3d4-0001-4e5f-8a9b-0c1d2e3f4a5b'],
+  ])('%s normalizes to %s', (input, expected) => {
+    expect(BleNitroManager.normalizeGattUUID(input)).toBe(expected);
+  });
+
+  test.each([
+    '',
+    'abc',
+    '12345',
+    '180g',
+    '0x180d',
+    ' 180d',
+    'a1b2c3d4-0001-4e5f-8a9b-0c1d2e3f4a5',
+    'a1b2c3d4-0001-4e5f-8a9b-0c1d2e3f4a5b0',
+    'a1b2c3d40001-4e5f-8a9b-0c1d2e3f4a5b',
+    '{a1b2c3d4-0001-4e5f-8a9b-0c1d2e3f4a5b}',
+  ])('%p is rejected with InvalidIdentifiers', (input) => {
+    expect(() => BleNitroManager.normalizeGattUUID(input)).toThrow(
+      expect.objectContaining({ errorCode: BleErrorCode.InvalidIdentifiers })
+    );
+  });
+
+  test('methods returning a promise reject a malformed UUID instead of throwing, and call nothing native', async () => {
     const ble = new BleNitroManager();
-    native.isConnected.mockReturnValue(true);
+    const invalid = { errorCode: BleErrorCode.InvalidIdentifiers, deviceId: 'DEV-1' };
+
+    await expect(ble.readCharacteristic('dev-1', '180f', '2a1')).rejects.toMatchObject(invalid);
+    await expect(ble.writeCharacteristic('dev-1', 'battery', '2a19', [1])).rejects.toMatchObject(invalid);
+    await expect(
+      ble.subscribeToCharacteristic('dev-1', undefined as unknown as string, '2a37', jest.fn())
+    ).rejects.toMatchObject(invalid);
+    await expect(ble.findAndConnect('dev-1', { serviceUUIDs: ['180d', 'nope'] })).rejects.toMatchObject(invalid);
+
+    expect(native.readCharacteristic).not.toHaveBeenCalled();
+    expect(native.writeCharacteristic).not.toHaveBeenCalled();
+    expect(native.subscribeToCharacteristic).not.toHaveBeenCalled();
+    expect(native.startScan).not.toHaveBeenCalled();
+    expect(() => ble.getCharacteristics('dev-1', '18 0d')).toThrow(expect.objectContaining(invalid));
+  });
+});
+
+describe('connection', () => {
+  test('connect resolves with the canonical id and reports disconnects with a BleError', async () => {
+    const ble = new BleNitroManager();
     const onDisconnect = jest.fn<void, [string, boolean, BleError | undefined]>();
 
-    const connect = ble.connect('dev-1', { refreshGattAndroid: true, timeoutMs: 10_000 }, onDisconnect);
-    const [deviceId, options, complete, disconnectCallback] = lastCall(native.connect);
-    expect(deviceId).toBe('dev-1');
-    expect(options).toEqual({ autoConnect: undefined, refreshGatt: true, timeoutMs: 10_000 });
+    const connect = ble.connect('aa:bb:cc:dd:ee:ff', { timeoutMs: 10_000 }, onDisconnect);
+    const [, , complete, disconnectCallback] = lastCall(native.connect);
     complete(undefined);
-    await expect(connect).resolves.toBe('dev-1');
+    await expect(connect).resolves.toBe('AA:BB:CC:DD:EE:FF');
 
-    expect(disconnectCallback).toBeDefined();
-    disconnectCallback?.('dev-1', true, disconnected);
+    disconnectCallback?.('AA:BB:CC:DD:EE:FF', true, disconnected);
     expect(onDisconnect).toHaveBeenCalledTimes(1);
     const [id, interrupted, error] = lastCall(onDisconnect);
-    expect([id, interrupted]).toEqual(['dev-1', true]);
+    expect([id, interrupted]).toEqual(['AA:BB:CC:DD:EE:FF', true]);
     expect(error).toBeInstanceOf(BleError);
-    expect(error).toMatchObject({ errorCode: BleErrorCode.DeviceDisconnected, nativeStatus: 8, deviceId: 'dev-1' });
+    expect(error).toMatchObject({
+      errorCode: BleErrorCode.DeviceDisconnected,
+      nativeStatus: 8,
+      deviceId: 'AA:BB:CC:DD:EE:FF',
+    });
+  });
+
+  test('connect and findAndConnect take a null options object like an absent one', async () => {
+    const ble = new BleNitroManager();
+
+    const connect = ble.connect('dev-1', null as unknown as ConnectOptions);
+    lastCall(native.connect)[2](undefined);
+    await expect(connect).resolves.toBe('DEV-1');
+
+    const find = ble.findAndConnect('dev-2', null as unknown as FindAndConnectOptions);
+    lastCall(native.startScan)[1](nativeDevice({ id: 'DEV-2' }), undefined);
+    lastCall(native.connect)[2](undefined);
+    await expect(find).resolves.toBe('DEV-2');
   });
 
   test('disconnect goes to native while not connected, cancelling a pending connect', async () => {
@@ -192,15 +281,6 @@ describe('connection', () => {
     await expect(disconnect).resolves.toBeUndefined();
   });
 
-  test('requestConnectionPriority maps the priority and resolves on completion', async () => {
-    const ble = new BleNitroManager();
-    const request = ble.requestConnectionPriority('dev-1', AndroidConnectionPriority.High);
-    const [, priority, complete] = lastCall(native.requestConnectionPriority);
-    expect(priority).toBe(1);
-    complete(undefined);
-    await expect(request).resolves.toBeUndefined();
-  });
-
   test('getServicesWithCharacteristics resolves after discovery with lowercase 128-bit UUIDs', async () => {
     const ble = new BleNitroManager();
     native.getServices.mockReturnValue(['180F', 'A1B2C3D4-0001-4E5F-8A9B-0C1D2E3F4A5B']);
@@ -210,12 +290,65 @@ describe('connection', () => {
 
     const services = ble.getServicesWithCharacteristics('dev-1');
     expect(native.getServices).not.toHaveBeenCalled();
-    lastCall(native.discoverServicesWithCharacteristics)[1](undefined);
+    lastCall(native.discoverServices)[1](undefined);
 
     await expect(services).resolves.toEqual([
       { uuid: '0000180f-0000-1000-8000-00805f9b34fb', characteristics: ['00002a19-0000-1000-8000-00805f9b34fb'] },
       { uuid: 'a1b2c3d4-0001-4e5f-8a9b-0c1d2e3f4a5b', characteristics: ['a1b2c3d4-0002-4e5f-8a9b-0c1d2e3f4a5b'] },
     ]);
+  });
+});
+
+describe('connection events', () => {
+  test('each listener gets the events with a string type and a BleError; remove() unregisters only its own, once', () => {
+    const ble = new BleNitroManager();
+    const first = jest.fn<void, [ConnectionEvent]>();
+    const second = jest.fn<void, [ConnectionEvent]>();
+    const firstSubscription = ble.onConnectionEvent(first);
+    ble.onConnectionEvent(second);
+    const {
+      args: [emitFirst],
+      id: firstId,
+    } = registration(native.subscribeToConnectionEvents, 0);
+    const {
+      args: [emitSecond],
+    } = registration(native.subscribeToConnectionEvents, 1);
+
+    emitFirst({
+      deviceId: 'AA:BB:CC:DD:EE:FF',
+      type: NativeConnectionEventType.Disconnected,
+      interrupted: true,
+      error: disconnected,
+    });
+    expect(first).toHaveBeenCalledTimes(1);
+    const [event] = lastCall(first);
+    expect(event).toMatchObject({ deviceId: 'AA:BB:CC:DD:EE:FF', type: ConnectionEventType.Disconnected, interrupted: true });
+    expect(event.error).toBeInstanceOf(BleError);
+    expect(event.error).toMatchObject({
+      errorCode: BleErrorCode.DeviceDisconnected,
+      nativeStatus: 8,
+      deviceId: 'AA:BB:CC:DD:EE:FF',
+    });
+
+    emitFirst({ deviceId: 'AA:BB:CC:DD:EE:FF', type: NativeConnectionEventType.ServicesChanged, interrupted: false });
+    expect(lastCall(first)[0]).toEqual({
+      deviceId: 'AA:BB:CC:DD:EE:FF',
+      type: ConnectionEventType.ServicesChanged,
+      interrupted: false,
+      error: undefined,
+    });
+
+    firstSubscription.remove();
+    firstSubscription.remove();
+    expect(native.unsubscribeFromConnectionEvents).toHaveBeenCalledTimes(1);
+    expect(native.unsubscribeFromConnectionEvents).toHaveBeenCalledWith(firstId);
+
+    // An event already on its way to the JS thread when remove() ran.
+    const connected = { deviceId: 'AA:BB:CC:DD:EE:FF', type: NativeConnectionEventType.Connected, interrupted: false };
+    emitFirst(connected);
+    emitSecond(connected);
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(lastCall(second)[0]).toMatchObject({ type: ConnectionEventType.Connected });
   });
 });
 
@@ -267,7 +400,6 @@ describe('scanning', () => {
     const firstCallback = lastCall(native.startScan)[1];
     ble.startScan({}, second);
     const secondCallback = lastCall(native.startScan)[1];
-    expect(native.stopScan).toHaveBeenCalledTimes(1);
 
     firstCallback(nativeDevice(), undefined);
     secondCallback(nativeDevice(), undefined);
@@ -278,15 +410,29 @@ describe('scanning', () => {
     expect(second).toHaveBeenCalledTimes(1);
   });
 
+  test('an invalid filter throws InvalidIdentifiers and leaves the running scan untouched', () => {
+    const ble = new BleNitroManager();
+    const onDevice = jest.fn();
+    ble.startScan({}, onDevice);
+    const callback = lastCall(native.startScan)[1];
+
+    expect(() => ble.startScan({ serviceUUIDs: ['heart rate'] }, jest.fn())).toThrow(
+      expect.objectContaining({ errorCode: BleErrorCode.InvalidIdentifiers })
+    );
+    expect(native.stopScan).not.toHaveBeenCalled();
+    expect(native.startScan).toHaveBeenCalledTimes(1);
+    callback(nativeDevice(), undefined);
+    expect(onDevice).toHaveBeenCalledTimes(1);
+  });
+
   test('a scan failure ends the scan and goes to onError, or is thrown without onError', () => {
     const ble = new BleNitroManager();
     const onDevice = jest.fn();
     const onError = jest.fn<void, [BleError]>();
-    const failure: NativeBleError = { code: BleErrorCode.ScanStartFailed, message: 'Scanning too frequently', nativeStatus: 6 };
 
     ble.startScan({}, onDevice, onError);
     const callback = lastCall(native.startScan)[1];
-    callback(undefined, failure);
+    callback(undefined, scanFailure);
     callback(nativeDevice(), undefined);
 
     expect(onDevice).not.toHaveBeenCalled();
@@ -296,28 +442,32 @@ describe('scanning', () => {
     expect(scanError).toMatchObject({ errorCode: BleErrorCode.ScanStartFailed, nativeStatus: 6 });
 
     ble.startScan({}, onDevice);
-    expect(() => lastCall(native.startScan)[1](undefined, failure)).toThrow(BleError);
+    expect(() => lastCall(native.startScan)[1](undefined, scanFailure)).toThrow(BleError);
   });
 });
 
 describe('findAndConnect', () => {
-  test('connects once the scan finds the device, and stops the scan', async () => {
+  test('scans with the service filter, matches the id in any letter case, then stops the scan and connects', async () => {
     const ble = new BleNitroManager();
     const onFound = jest.fn<void, [BLEDevice]>();
-    const result = ble.findAndConnect('dev-2', { onFound, autoConnectAndroid: true });
+    const result = ble.findAndConnect('aa:bb:cc:dd:ee:02', {
+      serviceUUIDs: ['180D'],
+      onFound,
+      autoConnectAndroid: true,
+    });
 
-    const scanCallback = lastCall(native.startScan)[1];
-    scanCallback(nativeDevice({ id: 'dev-1' }), undefined);
+    const [filter, scanCallback] = lastCall(native.startScan);
+    expect(filter.serviceUUIDs).toEqual(['0000180d-0000-1000-8000-00805f9b34fb']);
+    scanCallback(nativeDevice({ id: 'AA:BB:CC:DD:EE:01' }), undefined);
     expect(native.connect).not.toHaveBeenCalled();
-    scanCallback(nativeDevice({ id: 'dev-2' }), undefined);
+    scanCallback(nativeDevice({ id: 'AA:BB:CC:DD:EE:02' }), undefined);
 
     expect(native.stopScan).toHaveBeenCalledTimes(1);
-    expect(onFound).toHaveBeenCalledWith(expect.objectContaining({ id: 'dev-2' }));
-    const [deviceId, options, complete] = lastCall(native.connect);
-    expect(deviceId).toBe('dev-2');
+    expect(onFound).toHaveBeenCalledWith(expect.objectContaining({ id: 'AA:BB:CC:DD:EE:02' }));
+    const [, options, complete] = lastCall(native.connect);
     expect(options).toMatchObject({ autoConnect: true });
     complete(undefined);
-    await expect(result).resolves.toBe('dev-2');
+    await expect(result).resolves.toBe('AA:BB:CC:DD:EE:02');
   });
 
   test('rejects with DeviceNotFound when the scan does not find the device in time', async () => {
@@ -326,9 +476,36 @@ describe('findAndConnect', () => {
     const result = ble.findAndConnect('dev-2', { scanTimeout: 1000 });
 
     jest.advanceTimersByTime(1000);
-    await expect(result).rejects.toMatchObject({ errorCode: BleErrorCode.DeviceNotFound, deviceId: 'dev-2' });
+    await expect(result).rejects.toMatchObject({ errorCode: BleErrorCode.DeviceNotFound, deviceId: 'DEV-2' });
     expect(native.stopScan).toHaveBeenCalledTimes(1);
     expect(native.connect).not.toHaveBeenCalled();
+  });
+
+  test('rejects with the scan error when its scan fails, without a later DeviceNotFound or stop', async () => {
+    jest.useFakeTimers();
+    const ble = new BleNitroManager();
+    const result = ble.findAndConnect('dev-2', { scanTimeout: 1000 });
+
+    lastCall(native.startScan)[1](undefined, scanFailure);
+    jest.advanceTimersByTime(1000);
+    await expect(result).rejects.toMatchObject({ errorCode: BleErrorCode.ScanStartFailed, nativeStatus: 6, deviceId: 'DEV-2' });
+    expect(native.stopScan).not.toHaveBeenCalled();
+  });
+
+  test('once the device was found, its scan timeout leaves a scan started later alone', async () => {
+    jest.useFakeTimers();
+    const ble = new BleNitroManager();
+    const result = ble.findAndConnect('dev-2', { scanTimeout: 1000 });
+    lastCall(native.startScan)[1](nativeDevice({ id: 'DEV-2' }), undefined);
+    lastCall(native.connect)[2](undefined);
+    await expect(result).resolves.toBe('DEV-2');
+
+    const onDevice = jest.fn();
+    ble.startScan({}, onDevice);
+    jest.advanceTimersByTime(1000);
+    lastCall(native.startScan)[1](nativeDevice(), undefined);
+    expect(onDevice).toHaveBeenCalledTimes(1);
+    expect(native.stopScan).toHaveBeenCalledTimes(1);
   });
 
   test('connects to an already connected device without scanning', async () => {
@@ -340,72 +517,126 @@ describe('findAndConnect', () => {
     expect(native.startScan).not.toHaveBeenCalled();
     const [, , complete, disconnectCallback] = lastCall(native.connect);
     complete(undefined);
-    await expect(result).resolves.toBe('dev-2');
-    disconnectCallback?.('dev-2', false, undefined);
-    expect(onDisconnect).toHaveBeenCalledWith('dev-2', false, undefined);
+    await expect(result).resolves.toBe('DEV-2');
+    disconnectCallback?.('DEV-2', false, undefined);
+    expect(onDisconnect).toHaveBeenCalledWith('DEV-2', false, undefined);
+  });
+
+  test('rejects at once with OperationCancelled when a newer scan or stopScan() ends its scan', async () => {
+    // Fake timers that never advance: a rejection can't come from the timeout.
+    jest.useFakeTimers();
+    const ble = new BleNitroManager();
+
+    const replaced = ble.findAndConnect('dev-1');
+    const onDevice = jest.fn();
+    ble.startScan({}, onDevice);
+    await expect(replaced).rejects.toMatchObject({ errorCode: BleErrorCode.OperationCancelled, deviceId: 'DEV-1' });
+    lastCall(native.startScan)[1](nativeDevice({ id: 'dev-1' }), undefined);
+    expect(onDevice).toHaveBeenCalledTimes(1);
+
+    const stopped = ble.findAndConnect('dev-1');
+    ble.stopScan();
+    await expect(stopped).rejects.toMatchObject({ errorCode: BleErrorCode.OperationCancelled });
+    expect(native.connect).not.toHaveBeenCalled();
+  });
+
+  test('rejects at once with BluetoothManagerDestroyed when destroy() ends its scan', async () => {
+    jest.useFakeTimers();
+    const ble = new BleNitroManager();
+    const result = ble.findAndConnect('dev-1');
+
+    ble.destroy();
+    await expect(result).rejects.toMatchObject({ errorCode: BleErrorCode.BluetoothManagerDestroyed, deviceId: 'DEV-1' });
   });
 });
 
 describe('Bluetooth state', () => {
-  test('one native subscription serves every subscriber; remove() removes only its own', () => {
+  test('every listener registers natively; remove() unregisters only its own, once', () => {
     const ble = new BleNitroManager();
     const first = jest.fn();
     const second = jest.fn();
 
-    const firstSubscription = ble.subscribeToStateChange(first, true);
+    const firstSubscription = ble.subscribeToStateChange(first);
     const secondSubscription = ble.subscribeToStateChange(second);
-    expect(native.subscribeToStateChange).toHaveBeenCalledTimes(1);
-    expect(first).toHaveBeenCalledWith(BLEState.PoweredOn);
-    expect(second).not.toHaveBeenCalled();
-
-    const emit = lastCall(native.subscribeToStateChange)[0];
-    emit(NativeBLEState.PoweredOff);
+    const {
+      args: [emitFirst],
+      id: firstId,
+    } = registration(native.subscribeToStateChange, 0);
+    const {
+      args: [emitSecond],
+      id: secondId,
+    } = registration(native.subscribeToStateChange, 1);
+    emitFirst(NativeBLEState.PoweredOff);
+    emitSecond(NativeBLEState.PoweredOff);
     expect(first).toHaveBeenLastCalledWith(BLEState.PoweredOff);
     expect(second).toHaveBeenLastCalledWith(BLEState.PoweredOff);
 
     firstSubscription.remove();
-    expect(native.unsubscribeFromStateChange).not.toHaveBeenCalled();
-    emit(NativeBLEState.Unauthorized);
-    expect(first).toHaveBeenCalledTimes(2);
+    firstSubscription.remove();
+    expect(native.unsubscribeFromStateChange).toHaveBeenCalledTimes(1);
+    expect(native.unsubscribeFromStateChange).toHaveBeenCalledWith(firstId);
+
+    // A change already on its way to the JS thread when remove() ran.
+    emitFirst(NativeBLEState.Unauthorized);
+    emitSecond(NativeBLEState.Unauthorized);
+    expect(first).toHaveBeenCalledTimes(1);
     expect(second).toHaveBeenLastCalledWith(BLEState.Unauthorized);
 
     secondSubscription.remove();
-    secondSubscription.remove();
-    expect(native.unsubscribeFromStateChange).toHaveBeenCalledTimes(1);
-
-    ble.subscribeToStateChange(jest.fn());
-    expect(native.subscribeToStateChange).toHaveBeenCalledTimes(2);
+    expect(native.unsubscribeFromStateChange).toHaveBeenLastCalledWith(secondId);
   });
 
-  test('a throwing subscriber does not keep the state from the others; its error is rethrown', () => {
-    jest.useFakeTimers();
+  test('emitInitial registers before reading the state, and reports it before returning', () => {
     const ble = new BleNitroManager();
-    const after = jest.fn();
-    ble.subscribeToStateChange(() => {
-      throw new Error('subscriber bug');
+    const steps: string[] = [];
+    native.subscribeToStateChange.mockImplementation(() => {
+      steps.push('register');
+      return 1;
     });
-    ble.subscribeToStateChange(after);
+    native.state.mockImplementation(() => {
+      steps.push('read');
+      return NativeBLEState.PoweredOff;
+    });
+    const callback = jest.fn();
 
-    lastCall(native.subscribeToStateChange)[0](NativeBLEState.PoweredOff);
-    expect(after).toHaveBeenCalledWith(BLEState.PoweredOff);
-    expect(() => jest.runOnlyPendingTimers()).toThrow('subscriber bug');
+    ble.subscribeToStateChange(callback, true);
+    expect(steps).toEqual(['register', 'read']);
+    expect(callback).toHaveBeenCalledWith(BLEState.PoweredOff);
+
+    lastCall(native.subscribeToStateChange)[0](NativeBLEState.PoweredOn);
+    expect(callback).toHaveBeenLastCalledWith(BLEState.PoweredOn);
+  });
+
+  test('when the emitInitial call throws, the exception propagates and the listener is removed', () => {
+    const ble = new BleNitroManager();
+    const bug = new Error('listener bug');
+    const callback = jest.fn(() => {
+      throw bug;
+    });
+
+    expect(() => ble.subscribeToStateChange(callback, true)).toThrow(bug);
+    const {
+      args: [emit],
+      id,
+    } = registration(native.subscribeToStateChange, 0);
+    expect(native.unsubscribeFromStateChange).toHaveBeenCalledWith(id);
+    emit(NativeBLEState.PoweredOff);
+    expect(callback).toHaveBeenCalledTimes(1);
   });
 });
 
-describe('characteristics', () => {
-  test('writes pass an ArrayBuffer through as is, convert a number[] once, and resolve when native completes', async () => {
+describe('writes', () => {
+  test('resolve with the bytes written once native completes; withResponse defaults to true', async () => {
     const ble = new BleNitroManager();
-    const payload = bytes(1, 2, 3);
 
-    const write = ble.writeCharacteristic('dev-1', '180F', '2A19', payload, false);
-    const [deviceId, service, characteristic, data, withResponse, complete] = lastCall(native.writeCharacteristic);
-    expect([deviceId, service, characteristic, withResponse]).toEqual([
-      'dev-1',
+    const write = ble.writeCharacteristic('dev-1', '180F', '2A19', bytes(1, 2, 3), false);
+    const [, service, characteristic, data, withResponse, complete] = lastCall(native.writeCharacteristic);
+    expect([service, characteristic, withResponse]).toEqual([
       '0000180f-0000-1000-8000-00805f9b34fb',
       '00002a19-0000-1000-8000-00805f9b34fb',
       false,
     ]);
-    expect(data).toBe(payload);
+    expect(bytesOf(data)).toEqual([1, 2, 3]);
     let settled = false;
     write.then(() => (settled = true));
     await Promise.resolve();
@@ -414,14 +645,51 @@ describe('characteristics', () => {
     complete(undefined, response);
     await expect(write).resolves.toBe(response);
 
-    ble.writeCharacteristic('dev-1', '180f', '2a19', [0xde, 0xad]);
+    ble.writeCharacteristic('dev-1', '180f', '2a19', [0x00, 0xde, 0xff]);
     const [, , , converted, defaultWithResponse] = lastCall(native.writeCharacteristic);
-    expect(converted).toBeInstanceOf(ArrayBuffer);
-    expect(Array.from(new Uint8Array(converted))).toEqual([0xde, 0xad]);
+    expect(bytesOf(converted)).toEqual([0x00, 0xde, 0xff]);
     expect(defaultWithResponse).toBe(true);
   });
 
-  test('subscribe resolves once the CCCD write completed and delivers each value as its native ArrayBuffer', async () => {
+  test('a view is written as exactly the bytes it views, not the rest of its buffer', () => {
+    const ble = new BleNitroManager();
+    const backing = bytes(0, 1, 2, 3, 4, 5);
+
+    ble.writeCharacteristic('dev-1', '180f', '2a19', new Uint8Array(backing, 2, 3));
+    expect(bytesOf(lastCall(native.writeCharacteristic)[3])).toEqual([2, 3, 4]);
+    ble.writeCharacteristic('dev-1', '180f', '2a19', new Uint8Array(backing).subarray(4));
+    expect(bytesOf(lastCall(native.writeCharacteristic)[3])).toEqual([4, 5]);
+    ble.writeCharacteristic('dev-1', '180f', '2a19', new DataView(backing, 1, 2));
+    expect(bytesOf(lastCall(native.writeCharacteristic)[3])).toEqual([1, 2]);
+    // A small Node-style Buffer lives in a shared pool buffer.
+    ble.writeCharacteristic('dev-1', '180f', '2a19', Buffer.from([0xaa, 0xbb]));
+    expect(bytesOf(lastCall(native.writeCharacteristic)[3])).toEqual([0xaa, 0xbb]);
+    ble.writeCharacteristic('dev-1', '180f', '2a19', new Uint8Array([7, 8]));
+    expect(bytesOf(lastCall(native.writeCharacteristic)[3])).toEqual([7, 8]);
+  });
+
+  test.each([[[256]], [[-1]], [[1.5]], [[NaN]], [[1, '2']], [[null]]])(
+    'data %p rejects with CharacteristicInvalidDataFormat and writes nothing',
+    async (data) => {
+      const ble = new BleNitroManager();
+      await expect(
+        ble.writeCharacteristic('dev-1', '180f', '2a19', data as number[])
+      ).rejects.toMatchObject({ errorCode: BleErrorCode.CharacteristicInvalidDataFormat, deviceId: 'DEV-1' });
+      expect(native.writeCharacteristic).not.toHaveBeenCalled();
+    }
+  );
+
+  test('data that is no bytes at all rejects with CharacteristicInvalidDataFormat', async () => {
+    const ble = new BleNitroManager();
+    await expect(
+      ble.writeCharacteristic('dev-1', '180f', '2a19', 'ab' as unknown as number[])
+    ).rejects.toMatchObject({ errorCode: BleErrorCode.CharacteristicInvalidDataFormat });
+    expect(native.writeCharacteristic).not.toHaveBeenCalled();
+  });
+});
+
+describe('characteristic subscriptions', () => {
+  test('subscribe resolves once the CCCD write completed; values arriving before are delivered too', async () => {
     const ble = new BleNitroManager();
     const onValue = jest.fn<void, [ArrayBuffer]>();
     const subscribe = ble.subscribeToCharacteristic('dev-1', '180D', '2A37', onValue);
@@ -431,6 +699,9 @@ describe('characteristics', () => {
       '00002a37-0000-1000-8000-00805f9b34fb',
     ]);
 
+    const early = bytes(0x06, 0x40);
+    notify(early);
+    expect(lastCall(onValue)[0]).toBe(early);
     let subscribed = false;
     subscribe.then(() => (subscribed = true));
     await Promise.resolve();
@@ -440,11 +711,44 @@ describe('characteristics', () => {
 
     const value = bytes(0x06, 0x48);
     notify(value);
-    expect(onValue).toHaveBeenCalledTimes(1);
+    expect(onValue).toHaveBeenCalledTimes(2);
     expect(lastCall(onValue)[0]).toBe(value);
   });
 
-  test('remove() unsubscribes and drops later values; a failed unsubscribe rejects', async () => {
+  test('remove() ends only its own subscription: another one of the same characteristic keeps receiving', async () => {
+    const ble = new BleNitroManager();
+    const older = jest.fn();
+    const newer = jest.fn();
+
+    const olderSubscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', older);
+    const {
+      args: [, , , olderNotify, olderComplete],
+      id: olderId,
+    } = registration(native.subscribeToCharacteristic, 0);
+    olderComplete(undefined);
+    const olderSubscription = await olderSubscribe;
+
+    // The older one is removed while the newer subscribe is still pending.
+    const newerSubscribe = ble.subscribeToCharacteristic('dev-1', '0000180d-0000-1000-8000-00805f9b34fb', '2A37', newer);
+    const {
+      args: [, , , newerNotify, newerComplete],
+    } = registration(native.subscribeToCharacteristic, 1);
+    const remove = olderSubscription.remove();
+    expect(native.unsubscribeFromCharacteristic).toHaveBeenCalledTimes(1);
+    const [removedId, unsubscribed] = lastCall(native.unsubscribeFromCharacteristic);
+    expect(removedId).toBe(olderId);
+    unsubscribed(undefined);
+    await remove;
+    newerComplete(undefined);
+    await newerSubscribe;
+
+    olderNotify(bytes(1));
+    newerNotify(bytes(2));
+    expect(older).not.toHaveBeenCalled();
+    expect(newer).toHaveBeenCalledTimes(1);
+  });
+
+  test('remove() stops the values at once; every call shares the outcome of the one unsubscribe', async () => {
     const ble = new BleNitroManager();
     const onValue = jest.fn();
     const subscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', onValue);
@@ -453,44 +757,95 @@ describe('characteristics', () => {
     const subscription = await subscribe;
 
     const remove = subscription.remove();
+    const secondRemove = subscription.remove();
     notify(bytes(1));
     expect(onValue).not.toHaveBeenCalled();
-    lastCall(native.unsubscribeFromCharacteristic)[3]({
+    lastCall(native.unsubscribeFromCharacteristic)[1]({
       code: BleErrorCode.CharacteristicNotifyChangeFailed,
       message: 'Descriptor write failed',
       nativeStatus: 133,
     });
-    await expect(remove).rejects.toMatchObject({
-      errorCode: BleErrorCode.CharacteristicNotifyChangeFailed,
-      nativeStatus: 133,
-      deviceId: 'dev-1',
-    });
-
-    await expect(subscription.remove()).resolves.toBeUndefined();
+    const failed = { errorCode: BleErrorCode.CharacteristicNotifyChangeFailed, nativeStatus: 133, deviceId: 'DEV-1' };
+    await expect(remove).rejects.toMatchObject(failed);
+    await expect(secondRemove).rejects.toMatchObject(failed);
+    await expect(subscription.remove()).rejects.toMatchObject(failed);
     expect(native.unsubscribeFromCharacteristic).toHaveBeenCalledTimes(1);
   });
 
-  test('a newer subscription to the same characteristic supersedes the older one', async () => {
+  test('an ended subscription calls onEnded once, gets no more values, and its remove() does nothing', async () => {
     const ble = new BleNitroManager();
-    const older = jest.fn();
-    const newer = jest.fn();
+    const onValue = jest.fn();
+    const onEnded = jest.fn<void, [BleError]>();
+    const subscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', onValue, onEnded);
+    const [, , , notify, complete, ended] = lastCall(native.subscribeToCharacteristic);
+    complete(undefined);
+    const subscription = await subscribe;
 
-    const olderSubscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', older);
-    const [, , , olderNotify, olderComplete] = lastCall(native.subscribeToCharacteristic);
-    olderComplete(undefined);
-    const olderSubscription = await olderSubscribe;
+    ended?.(disconnected);
+    expect(onEnded).toHaveBeenCalledTimes(1);
+    const [error] = lastCall(onEnded);
+    expect(error).toBeInstanceOf(BleError);
+    expect(error).toMatchObject({ errorCode: BleErrorCode.DeviceDisconnected, nativeStatus: 8, deviceId: 'DEV-1' });
+    notify(bytes(1));
+    expect(onValue).not.toHaveBeenCalled();
+    await expect(subscription.remove()).resolves.toBeUndefined();
 
-    const newerSubscribe = ble.subscribeToCharacteristic('dev-1', '0000180d-0000-1000-8000-00805f9b34fb', '2A37', newer);
-    const [, , , newerNotify, newerComplete] = lastCall(native.subscribeToCharacteristic);
-    newerComplete(undefined);
-    await newerSubscribe;
+    // Without onEnded, an ended subscription's remove() does nothing either.
+    const quietSubscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', jest.fn());
+    const [, , , , quietComplete, quietEnded] = lastCall(native.subscribeToCharacteristic);
+    quietComplete(undefined);
+    const quiet = await quietSubscribe;
+    quietEnded?.(disconnected);
+    await expect(quiet.remove()).resolves.toBeUndefined();
 
-    olderNotify(bytes(1));
-    newerNotify(bytes(2));
-    await olderSubscription.remove();
+    expect(native.unsubscribeFromCharacteristic).not.toHaveBeenCalled();
+  });
 
-    expect(older).not.toHaveBeenCalled();
-    expect(newer).toHaveBeenCalledTimes(1);
+  test('onEnded is not called once remove() has started', async () => {
+    const ble = new BleNitroManager();
+    const onEnded = jest.fn();
+    const subscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', jest.fn(), onEnded);
+    const [, , , , complete, ended] = lastCall(native.subscribeToCharacteristic);
+    complete(undefined);
+    const subscription = await subscribe;
+
+    const remove = subscription.remove();
+    // The link went down while the unsubscribe was queued.
+    ended?.(disconnected);
+    lastCall(native.unsubscribeFromCharacteristic)[1](undefined);
+    await remove;
+    expect(onEnded).not.toHaveBeenCalled();
+  });
+
+  test('a failed subscribe rejects and delivers nothing afterwards', async () => {
+    const ble = new BleNitroManager();
+    const onValue = jest.fn();
+    const subscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', onValue);
+    const [, , , notify, complete] = lastCall(native.subscribeToCharacteristic);
+
+    complete({ code: BleErrorCode.CharacteristicNotifyChangeFailed, message: 'CCCD write failed', nativeStatus: 133 });
+    await expect(subscribe).rejects.toMatchObject({
+      errorCode: BleErrorCode.CharacteristicNotifyChangeFailed,
+      nativeStatus: 133,
+      deviceId: 'DEV-1',
+    });
+    notify(bytes(1));
+    expect(onValue).not.toHaveBeenCalled();
+  });
+
+  test('a subscribe whose native call throws rejects, and nothing is released natively later', async () => {
+    const ble = new BleNitroManager();
+    const thrown = new Error('JNI exception');
+    native.subscribeToCharacteristic.mockImplementationOnce(() => {
+      throw thrown;
+    });
+
+    await expect(ble.subscribeToCharacteristic('dev-1', '180d', '2a37', jest.fn())).rejects.toMatchObject({
+      errorCode: BleErrorCode.UnknownError,
+      deviceId: 'DEV-1',
+      cause: thrown,
+    });
+    ble.destroy();
     expect(native.unsubscribeFromCharacteristic).not.toHaveBeenCalled();
   });
 });
@@ -502,62 +857,106 @@ describe('state restoration', () => {
     expect(identifier).toBe('restore-key');
     if (!restore) throw new Error('The manager passed no restore callback');
 
-    restore([nativeDevice({ id: 'dev-1', isConnected: true })]);
+    restore([nativeDevice({ id: 'DEV-1', isConnected: true })]);
     const first = jest.fn<void, [BLEDevice[]]>();
     const second = jest.fn<void, [BLEDevice[]]>();
     ble.onRestoredState(first);
     ble.onRestoredState(second);
 
     expect(first).toHaveBeenCalledTimes(1);
-    expect(lastCall(first)[0]).toEqual([expect.objectContaining({ id: 'dev-1', isConnected: true })]);
+    expect(lastCall(first)[0]).toEqual([expect.objectContaining({ id: 'DEV-1', isConnected: true })]);
     expect(second).not.toHaveBeenCalled();
-
-    restore([nativeDevice({ id: 'dev-2' })]);
-    expect(second).toHaveBeenCalledWith([expect.objectContaining({ id: 'dev-2' })]);
   });
 });
 
 describe('destroy', () => {
-  test('releases native once, ends subscriptions, and makes later calls fail with BluetoothManagerDestroyed', async () => {
+  test('no listener is called afterwards, not even for reports already on their way', async () => {
     const ble = new BleNitroManager();
     const onState = jest.fn();
-    const stateSubscription = ble.subscribeToStateChange(onState);
+    ble.subscribeToStateChange(onState);
     const emitState = lastCall(native.subscribeToStateChange)[0];
+    const onEvent = jest.fn();
+    ble.onConnectionEvent(onEvent);
+    const emitEvent = lastCall(native.subscribeToConnectionEvents)[0];
+    const onDisconnect = jest.fn();
+    const connect = ble.connect('dev-1', {}, onDisconnect);
+    const [, , connected, disconnectCallback] = lastCall(native.connect);
+    connected(undefined);
+    await connect;
     const onValue = jest.fn();
-    const subscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', onValue);
-    const [, , , notify, complete] = lastCall(native.subscribeToCharacteristic);
+    const onEnded = jest.fn();
+    const subscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', onValue, onEnded);
+    const [, , , notify, complete, ended] = lastCall(native.subscribeToCharacteristic);
     complete(undefined);
-    const valueSubscription = await subscribe;
-    const pendingRead = ble.readCharacteristic('dev-1', '180f', '2a19');
+    await subscribe;
+    const onPendingValue = jest.fn();
+    ble.subscribeToCharacteristic('dev-1', '180d', '2a38', onPendingValue).catch(() => undefined);
+    const [, , , pendingNotify] = lastCall(native.subscribeToCharacteristic);
 
     ble.destroy();
     ble.destroy();
     expect(native.destroy).toHaveBeenCalledTimes(1);
 
-    lastCall(native.readCharacteristic)[3](
-      { code: BleErrorCode.BluetoothManagerDestroyed, message: 'Manager destroyed' },
-      undefined
-    );
-    await expect(pendingRead).rejects.toMatchObject({ errorCode: BleErrorCode.BluetoothManagerDestroyed });
-
     emitState(NativeBLEState.PoweredOff);
+    emitEvent({ deviceId: 'DEV-1', type: NativeConnectionEventType.Disconnected, interrupted: false });
+    disconnectCallback?.('DEV-1', false, undefined);
     notify(bytes(1));
+    ended?.({ code: BleErrorCode.BluetoothManagerDestroyed, message: 'Manager destroyed' });
+    pendingNotify(bytes(2));
     expect(onState).not.toHaveBeenCalled();
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(onDisconnect).not.toHaveBeenCalled();
     expect(onValue).not.toHaveBeenCalled();
+    expect(onEnded).not.toHaveBeenCalled();
+    expect(onPendingValue).not.toHaveBeenCalled();
+  });
+
+  test('a success the native side sent before destroy() rejects with BluetoothManagerDestroyed', async () => {
+    const ble = new BleNitroManager();
+    const read = ble.readCharacteristic('dev-1', '180f', '2a19');
+    const subscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', jest.fn());
+    const connect = ble.connect('dev-2');
+
+    ble.destroy();
+    lastCall(native.readCharacteristic)[3](undefined, bytes(0x64));
+    lastCall(native.subscribeToCharacteristic)[4](undefined);
+    lastCall(native.connect)[2](undefined);
+
+    const destroyed = { errorCode: BleErrorCode.BluetoothManagerDestroyed };
+    await expect(read).rejects.toMatchObject({ ...destroyed, deviceId: 'DEV-1' });
+    await expect(subscribe).rejects.toMatchObject(destroyed);
+    await expect(connect).rejects.toMatchObject({ ...destroyed, deviceId: 'DEV-2' });
+    expect(native.unsubscribeFromCharacteristic).not.toHaveBeenCalled();
+  });
+
+  test('later calls fail with BluetoothManagerDestroyed; releasing calls do nothing', async () => {
+    const ble = new BleNitroManager();
+    const stateSubscription = ble.subscribeToStateChange(jest.fn());
+    const eventSubscription = ble.onConnectionEvent(jest.fn());
+    const subscribe = ble.subscribeToCharacteristic('dev-1', '180d', '2a37', jest.fn());
+    lastCall(native.subscribeToCharacteristic)[4](undefined);
+    const valueSubscription = await subscribe;
+
+    ble.destroy();
 
     await expect(ble.connect('dev-1')).rejects.toMatchObject({
       errorCode: BleErrorCode.BluetoothManagerDestroyed,
-      deviceId: 'dev-1',
+      deviceId: 'DEV-1',
     });
     expect(native.connect).not.toHaveBeenCalled();
-    expect(() => ble.state()).toThrow(expect.objectContaining({ errorCode: BleErrorCode.BluetoothManagerDestroyed }));
-    expect(() => ble.startScan({}, jest.fn())).toThrow(BleError);
+    const destroyed = expect.objectContaining({ errorCode: BleErrorCode.BluetoothManagerDestroyed });
+    expect(() => ble.state()).toThrow(destroyed);
+    expect(() => ble.startScan({}, jest.fn())).toThrow(destroyed);
+    expect(() => ble.subscribeToStateChange(jest.fn())).toThrow(destroyed);
+    expect(() => ble.onConnectionEvent(jest.fn())).toThrow(destroyed);
 
     ble.stopScan();
     stateSubscription.remove();
+    eventSubscription.remove();
     await expect(valueSubscription.remove()).resolves.toBeUndefined();
     expect(native.stopScan).not.toHaveBeenCalled();
     expect(native.unsubscribeFromStateChange).not.toHaveBeenCalled();
+    expect(native.unsubscribeFromConnectionEvents).not.toHaveBeenCalled();
     expect(native.unsubscribeFromCharacteristic).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,7 @@
 module.exports = {
+  // The fork is its own package; it also lives vendored inside other repos, whose
+  // ESLint configs must not merge into this one.
+  root: true,
   extends: [
     'plugin:@typescript-eslint/recommended',
     // 'prettier',

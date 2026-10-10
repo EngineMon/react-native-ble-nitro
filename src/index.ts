@@ -8,12 +8,16 @@ export {
   type ServiceData,
   type ConnectOptions,
   type FindAndConnectOptions,
+  type CharacteristicProperties,
+  type ConnectionEvent,
   type ScanCallback,
   type ScanErrorCallback,
   type RestoreStateCallback,
   type StateChangeCallback,
   type DisconnectEventCallback,
   type CharacteristicUpdateCallback,
+  type SubscriptionEndedCallback,
+  type ConnectionEventCallback,
   type Subscription,
   type AsyncSubscription,
   type BleNitroManagerOptions,
@@ -21,9 +25,10 @@ export {
   BLEState,
   AndroidScanMode,
   AndroidConnectionPriority,
+  ConnectionEventType,
   BleError,
   BleErrorCode,
   BleNitroManager,
-} from "./manager";
+} from './manager';
 
 export { BleNitro } from './singleton';

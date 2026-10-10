@@ -14,12 +14,18 @@ Pod::Spec.new do |s|
   s.source       = { :git => "https://github.com/EngineMon/react-native-ble-nitro.git", :tag => "v#{s.version}" }
 
   s.source_files = [
-    # Implementation (Swift)
+    # Implementation (Swift): the CoreBluetooth glue in ios/ and the platform-independent
+    # core in ios/Core, compiled into this one module.
     "ios/**/*.{swift}",
     # Autolinking/Registration (Objective-C++)
     "ios/**/*.{m,mm}",
     # Implementation (C++ objects)
     "cpp/**/*.{hpp,cpp}",
+  ]
+  # The core's unit tests (XCTest) run through the SwiftPM package (Package.swift,
+  # `swift test`), never in the app: XCTest isn't linked into an app target.
+  s.exclude_files = [
+    "ios/CoreTests/**/*",
   ]
   
   # iOS frameworks

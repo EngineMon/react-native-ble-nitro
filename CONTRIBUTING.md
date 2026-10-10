@@ -41,7 +41,11 @@ react-native-ble-nitro/
 │   ├── manager.ts           # BleNitroManager, BleError
 │   └── __tests__/           # Jest tests
 ├── ios/                     # iOS native implementation (Swift)
+│   ├── Core/               # Platform-independent core (Foundation only), also a SwiftPM target
+│   └── CoreTests/          # Its XCTest unit tests (not part of the pod)
 ├── android/                 # Android native implementation (Kotlin) and its unit tests
+├── scripts/                 # strip-fast-native.mjs, run after every nitrogen run
+├── Package.swift            # SwiftPM package for ios/Core and ios/CoreTests
 ├── plugin/                  # Expo config plugin
 ├── nitrogen/generated/      # Generated Nitro code (do not edit, not committed)
 └── example/                 # Example Expo app
@@ -62,10 +66,10 @@ npm install
 ### 2. Generate Nitro Code
 
 ```bash
-npx nitro-codegen
+npm run nitro-codegen
 ```
 
-This generates native bindings in `nitrogen/generated/` from the TypeScript specs.
+This runs nitrogen (pinned to 0.35.2 in `devDependencies`) to generate the native bindings in `nitrogen/generated/` from the TypeScript specs, then `scripts/strip-fast-native.mjs` (see [The FastNative strip step](#the-fastnative-strip-step)). Don't run `npx nitrogen` on its own: the Android build refuses bindings that weren't stripped.
 
 ### 3. Build TypeScript
 
@@ -121,7 +125,7 @@ JavaScript/TypeScript (BleNitroManager) → Nitro Specs → Generated Native Cod
 
 3. **Regenerate Nitro code** if you modified specs:
    ```bash
-   npx nitro-codegen
+   npm run nitro-codegen
    ```
 
 4. **Build and test**:
@@ -141,34 +145,63 @@ JavaScript/TypeScript (BleNitroManager) → Nitro Specs → Generated Native Cod
 ### Important Notes
 
 - **Never edit `nitrogen/generated/`** - these files are auto-generated
-- **Always run `nitro-codegen`** after modifying Nitro specs
+- **Always run `npm run nitro-codegen`** after modifying Nitro specs
 - **Add tests** for new functionality
 
 ## 🧪 Testing
 
-### Running Tests
+### JS tests (Jest)
 
 ```bash
-# Run all JS tests
+# Run all JS tests: the JS layer and the Expo plugin
 npm test
 
 # Run a specific test file
 npm test -- src/__tests__/index.test.ts
+```
 
-# Kotlin unit tests (GattOperationQueue, BleErrors, ScanStartThrottle), through the example app's Gradle project
+- `src/__tests__/` tests the JS layer (`src/`) against a mocked native object; `src/__tests__/index.test.ts` shows how the native factory is mocked.
+- `plugin/__tests__/` tests the Expo plugin's manifest and Info.plist rules through the pure functions `applyAndroidManifest` and `applyInfoPlist` in `plugin/src/withBleNitro.ts`, without running a prebuild. The folder sits outside `plugin/src`, so the plugin build doesn't compile it.
+
+### Swift core tests (SwiftPM)
+
+`ios/Core` is the platform-independent part of the iOS implementation: the operation queue, the notification hub, the callback wrappers, ID and observer bookkeeping, and the GATT rules (property and length checks, connect timeout, MTU range). It uses Foundation only, so `Package.swift` builds it as a SwiftPM package and runs its tests without Xcode, CocoaPods, a simulator or a device:
+
+```bash
+# In the repository root; works on macOS and on Linux with a Swift toolchain
+swift test
+```
+
+The tests are in `ios/CoreTests`. The pod compiles `ios/Core` together with the CoreBluetooth code and leaves `ios/CoreTests` out (`BleNitro.podspec`).
+
+### Kotlin unit tests
+
+The Android core has the same pure classes under the same names (`GattOperationQueue`, `NotificationHub`, `GattRules`, `ObserverSet`, `IdSource`, the callback wrappers), plus `BleErrors` and `ScanStartThrottle`, tested as JVM unit tests in `android/src/test/`. Kotlin and Swift cover the same cases, so a behavior change goes into both. Run them through the example app's Gradle project:
+
+```bash
 cd example/android && ./gradlew :react-native-ble-nitro:testDebugUnitTest
 ```
 
-### Test Categories
+### The FastNative strip step
 
-1. **JS tests** (`src/__tests__/`): `BleNitroManager` against a mocked native object
-2. **Kotlin unit tests** (`android/src/test/`): the Android operation queue, error mapping and scan throttling
-3. **On-device testing**: the example app (`example/`) against real peripherals
+nitrogen 0.35 marks the JNI method behind every generated Kotlin callback class (`Func_*.kt`, `invoke_cxx`) `@FastNative`. A C++ callback that waits on a lock whose holder calls into Java during a garbage collection then hangs the app, because the collector can't suspend a thread inside a `@FastNative` method. `scripts/strip-fast-native.mjs` removes the annotation and its import from `nitrogen/generated/android`; `npm run nitro-codegen` runs it after nitrogen. The script fails without writing anything when nitrogen's output doesn't look as expected (no `Func_*.kt`, or a `FastNative` it doesn't know how to remove), so a nitrogen upgrade breaks it loudly.
+
+The Android build checks the result: the Gradle task `checkGeneratedBindingsHaveNoFastNative` fails while any generated Kotlin file of this library still mentions `FastNative` (the script's own rule, so the fully qualified `@dalvik.annotation.optimization.FastNative` form fails too), and also when `nitrogen/generated/android` is missing. Any other script that runs nitrogen for this library (e.g. an app that vendors it) must run the strip step too:
+
+```bash
+node scripts/strip-fast-native.mjs
+```
+
+When upgrading nitrogen, regenerate, check that the script still finds the annotation, and update the pin in `package.json` and the `react-native-nitro-modules` peer range together: the generated code depends on the nitrogen minor.
+
+### On-device testing
+
+The example app (`example/`) against real peripherals, on iOS and Android.
 
 ### Writing Tests
 
-- Use **Jest**; `src/__tests__/index.test.ts` shows how the native factory is mocked
 - Test both success and error scenarios, including the `BleErrorCode` of each failure
+- A change to the pure core gets the same test in Kotlin and Swift
 
 ## 📏 Code Standards
 
@@ -300,7 +333,7 @@ export interface NativeBleNitro extends HybridObject<{ ios: 'swift'; android: 'k
 Always run after spec changes:
 
 ```bash
-npx nitro-codegen
+npm run nitro-codegen
 ```
 
 This updates:
@@ -310,17 +343,24 @@ This updates:
 
 ## 📱 Native Development
 
-### iOS Development (Swift)
+Both platforms have the same layers under the same names, so a fix on one side has an obvious place on the other. Android sources are in `android/src/main/java/com/margelo/nitro/co/zyke/ble/`, iOS sources in `ios/`.
 
-- `ios/BleNitroBleManager.swift` implements the spec; `ios/BlePeripheralDelegate.swift` holds per-peripheral state and its operation queue
-- Everything runs on the `CBCentralManager`'s dedicated serial DispatchQueue; never touch BLE state from another thread
-- Every operation completes its callback exactly once, with a result or a `BleError`
+| Layer | Responsibility | Android | iOS |
+|---|---|---|---|
+| Facade | Implements the spec: parses and copies inputs on the caller's thread, allocates ids, wraps every user callback once through the `CallbackGate` (silent listeners and `BluetoothManagerDestroyed` completions after `destroy()`) | `BleNitroBleManager.kt`, `CallbackGate.kt` | `BleNitroBleManager.swift`, `CallbackGate.swift` |
+| Manager core | The adapter or central, the links, observers, scanning, `destroy()`; every asynchronous call enters through one entry point that fails it once `destroy()` was called | `BleCore.kt`, `BleScanner.kt`, `BleDevices.kt`, `GattUuid.kt`; Android only: `ScanPreconditions.kt`, `BluetoothEnableRequest.kt` | `BleCore.swift`, `BleScanner.swift`, `BleDevices.swift`, `GattUuid.swift`, `BleNitroConversions.swift`; iOS only: `PoweredOnWaiters.swift`, `StateRestoration.swift`, `BleCentralManagerDelegate.swift` |
+| Link | One device's connect and disconnect state machine and its single close funnel | `GattConnection.kt` | `PeripheralLink.swift` |
+| Session | One link-up: operation queue, notification hub, database generation, MTU, characteristic lookup, one class per operation | `GattSession.kt`, `LinkCallback.kt` | `GattSession.swift`, `GattSessionOperations.swift`, `DispatchOperationTimer.swift` |
+| Errors | Every `BleError` the library builds, with the same builder names on both platforms | `BleErrors.kt` | `BleErrors.swift` |
+| Pure core | `Callbacks`, `CoreLog`, `GattOperationQueue`, `GattRules`, `IdSource`, `NotificationHub`, `ObserverSet`: no OS or Nitro imports, the same names and test cases on both platforms | the same names in `android/src/main/.../ble/`, tests in `android/src/test/` | `ios/Core/`, tests in `ios/CoreTests/` |
 
-### Android Development (Kotlin)
+`BleNitroLifecycle.kt` (Android only) destroys every manager when React Native tears down a JS runtime.
 
-- Sources are in `android/src/main/java/com/margelo/nitro/co/zyke/ble/`: `BleNitroBleManager.kt` implements the spec, `GattConnection.kt` owns one link, `GattOperationQueue.kt` serializes its GATT operations
-- Everything runs on the manager's HandlerThread, which also receives every `BluetoothGattCallback`
-- Every operation completes its callback exactly once, with a result or a `BleError`
+On both platforms:
+
+- Everything runs on the manager's executor: Android's HandlerThread, which also receives every `BluetoothGattCallback`, and iOS's `CBCentralManager` serial DispatchQueue. Never touch BLE state from another thread.
+- Every operation completes its callback exactly once, with a result or a `BleError`.
+- Comments state the requirement a piece of code meets. Cite this library's contract as `NativeBleNitro.nitro.ts, "<section>"` and the Bluetooth specification as `Bluetooth Core Specification Vol N Part X §Y`.
 
 ## 🔀 Syncing with zykeco upstream
 

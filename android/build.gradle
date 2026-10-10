@@ -171,3 +171,59 @@ tasks.register('prepareHeaders', Copy) {
 }
 
 preBuild.dependsOn(prepareHeaders)
+
+// nitrogen 0.35 marks the JNI method behind every generated callback class
+// (Func_*.kt, invoke_cxx) @FastNative. That method runs the callback's C++
+// code, and the garbage collector cannot suspend a thread inside a @FastNative
+// method (Android's dalvik.annotation.optimization.FastNative documentation):
+// a C++ callback blocked on a lock whose holder calls into Java during a
+// collection stalls the collector's suspend-all, and the app hangs.
+// scripts/strip-fast-native.mjs removes the annotation after every nitrogen run
+// (npm run nitro-codegen runs both); this check keeps bindings generated
+// without that step from being compiled. It covers only this library's
+// generated bindings.
+//
+// It applies the script's own rule: a generated Kotlin file must not mention
+// FastNative at all, so the fully qualified
+// @dalvik.annotation.optimization.FastNative form fails too. The generated
+// directory is its input and a stamp file its output, so Gradle skips it while
+// the generated files are unchanged since the last passing check.
+def generatedAndroidBindings = file("../nitrogen/generated/android")
+def checkGeneratedBindings = tasks.register("checkGeneratedBindingsHaveNoFastNative") {
+  group = "verification"
+  description = "Fails when the Kotlin bindings nitrogen generated for this library mention FastNative."
+  inputs.dir(generatedAndroidBindings).withPropertyName("generatedAndroidBindings").optional()
+  def stamp = file("${project.buildDir}/checkGeneratedBindingsHaveNoFastNative.stamp")
+  outputs.file(stamp).withPropertyName("stamp")
+  doLast {
+    if (!generatedAndroidBindings.isDirectory()) {
+      throw new GradleException(
+        "react-native-ble-nitro: ${generatedAndroidBindings} doesn't exist. " +
+        "Run `npm run nitro-codegen` in react-native-ble-nitro (nitrogen, then " +
+        "scripts/strip-fast-native.mjs), then build again."
+      )
+    }
+    def offenders = []
+    generatedAndroidBindings.eachFileRecurse(groovy.io.FileType.FILES) { file ->
+      if (file.name.endsWith(".kt") && file.text.contains("FastNative")) {
+        offenders << file
+      }
+    }
+    if (!offenders.isEmpty()) {
+      throw new GradleException(
+        "react-native-ble-nitro: the generated Nitro bindings still mention FastNative, " +
+        "which can hang the app (scripts/strip-fast-native.mjs explains why):\n" +
+        offenders.collect { "  ${it}" }.join("\n") + "\n" +
+        "Run `node scripts/strip-fast-native.mjs` in react-native-ble-nitro " +
+        "(`npm run nitro-codegen` runs it after nitrogen), then build again."
+      )
+    }
+    stamp.parentFile.mkdirs()
+    stamp.text = "passed\n"
+  }
+}
+
+// Before every Kotlin compilation of this module (the library and its unit tests).
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+  dependsOn(checkGeneratedBindings)
+}

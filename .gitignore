@@ -16,6 +16,10 @@ plugin/build/
 # Generated Nitro code (regenerated via nitro-codegen)
 nitrogen/generated/
 
+# SwiftPM (`swift test` of ios/Core)
+.build/
+.swiftpm/
+
 # Testing
 coverage/
 .nyc_output

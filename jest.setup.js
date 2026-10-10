@@ -1,44 +1,11 @@
-// Create a mock native implementation that we can control in tests
-const createMockNativeModule = () => ({
-  // Scanning operations
-  startScan: jest.fn(),
-  stopScan: jest.fn(),
-  isScanning: jest.fn(),
-  
-  // Connection management
-  connect: jest.fn(),
-  disconnect: jest.fn(),
-  isConnected: jest.fn(),
-  requestConnectionPriority: jest.fn(),
-  
-  // Service discovery
-  discoverServices: jest.fn(),
-  discoverServicesWithCharacteristics: jest.fn(),
-  getServices: jest.fn(),
-  getCharacteristics: jest.fn(),
-  
-  // Characteristic operations
-  readCharacteristic: jest.fn(),
-  writeCharacteristic: jest.fn(),
-  subscribeToCharacteristic: jest.fn(),
-  unsubscribeFromCharacteristic: jest.fn(),
-  
-  // Bluetooth state management
-  isBluetoothEnabled: jest.fn(),
-  requestBluetoothEnable: jest.fn(),
-  state: jest.fn(),
-  subscribeToStateChange: jest.fn(),
-});
-
-// Mock react-native-nitro-modules for testing
+// Tests run in Node, without the Nitro runtime: each test mocks the native
+// manager factory (src/specs/NativeBleNitroFactory) itself. A test that
+// reaches Nitro anyway fails here with a clear message instead of inside
+// Nitro's native module loader.
 jest.mock('react-native-nitro-modules', () => ({
   NitroModules: {
-    createHybridObject: jest.fn(() => createMockNativeModule()),
+    createHybridObject: (name) => {
+      throw new Error(`A test created the HybridObject ${name}: mock src/specs/NativeBleNitroFactory instead`);
+    },
   },
 }));
-
-// Make the mock creator available globally for tests
-global.createMockNativeModule = createMockNativeModule;
-
-// Setup globals for React Native
-global.__DEV__ = true;
