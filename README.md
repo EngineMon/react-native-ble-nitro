@@ -1,14 +1,32 @@
-# react-native-ble-nitro
+# react-native-ble-nitro (EngineMon fork)
 
-[![npm version](https://badge.fury.io/js/react-native-ble-nitro.svg)](https://badge.fury.io/js/react-native-ble-nitro)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+> [!IMPORTANT]
+> This is [EngineMon](https://github.com/EngineMon)'s fork of [zykeco/react-native-ble-nitro](https://github.com/zykeco/react-native-ble-nitro), branched from upstream 1.15.1. It is **not published to npm**: `npm install react-native-ble-nitro` installs upstream 1.x, whose API differs from this README. Install it from GitHub ([Installation](#installation)).
 
 A high-performance React Native BLE library built on [Nitro Modules](https://nitro.margelo.com/).
 
 Originally developed for [Zyke Band](https://zykeband.com?utm_source=github&utm_medium=readme&utm_campaign=opensource) - a fitness and health tracker created by a small team.
 
-> [!IMPORTANT]
-> 2.0 changes the API. See [Migrating from 1.x to 2.0](#-migrating-from-1x-to-20).
+## 🍴 Why this fork
+
+EngineMon's phone app streams records from its device over BLE and decodes them in native code, off the JS thread. That needs a BLE layer that stays correct under sustained load and that native code can drive directly. This fork is that layer, released as 2.0:
+
+- **Per-device operation queues**: one GATT operation at a time per device, in call order, each with a 30 s timeout. Operations no longer race each other on Android's single-outstanding-operation GATT.
+- **Flow-controlled writes without response**: a write resolves when the OS accepted it, so a burst can't overflow the OS buffers and silently drop packets.
+- **Link-loss handling**: when a link drops or the manager is destroyed, every pending operation fails instead of hanging.
+- **A dedicated BLE thread per manager** on both platforms, with callbacks delivered in OS order.
+- **Typed errors**: every failure is a `BleError` with a code numbered like react-native-ble-plx's, plus the platform status.
+- **A C++ API**: another native module can use the same manager from C++, e.g. to consume a notification stream without a JS hop per notification.
+
+2.0 changes the API; see [Migrating from 1.x to 2.0](#-migrating-from-1x-to-20).
+
+### Relationship to upstream
+
+- `main` is upstream's history plus our commits. Upstream changes come in by merging `upstream/main`; `main` is never rebased or force-pushed, because consumers pin its commits.
+- The package name, the Expo plugin name and the native identifiers (pod `BleNitro`, `libBleNitro.so`, Kotlin package `com.margelo.nitro.co.zyke.ble`, C++ namespace `margelo::nitro::co::zyke::ble`) are upstream's, so upstream changes keep merging. As a consequence, this fork and upstream's package can't be installed in the same app.
+- Bugs in this fork belong in [this repository's issues](https://github.com/EngineMon/react-native-ble-nitro/issues), not upstream's.
 
 ## ✨ Features
 
@@ -29,9 +47,13 @@ Originally developed for [Zyke Band](https://zykeband.com?utm_source=github&utm_
 
 ### Installation
 
+Install from GitHub, pinned to a release tag:
+
 ```bash
-npm install react-native-nitro-modules react-native-ble-nitro
+npm install react-native-nitro-modules github:EngineMon/react-native-ble-nitro#v2.0.0
 ```
+
+npm builds the package on install (Nitro bindings, TypeScript and the Expo plugin). Imports and the Expo plugin keep the name `react-native-ble-nitro`.
 
 ### Expo Setup
 
@@ -825,13 +847,13 @@ open -a Android\ Studio.app
 react-native-ble-nitro/
 ├── src/
 │   ├── specs/              # Nitro module TypeScript specs
-│   ├── utils/             # Utility functions (UUID, Base64)
-│   └── errors/            # BLE error handling
-├── nitrogen/generated/     # Generated native code (Nitro)
-├── plugin/                # Expo config plugin
-├── ios/                   # iOS native implementation (Swift)
-├── android/               # Android native implementation (Kotlin)
-└── docs/                  # Documentation
+│   ├── manager.ts          # BleNitroManager, BleError
+│   └── __tests__/          # Jest tests
+├── nitrogen/generated/     # Generated native code (Nitro, not committed)
+├── plugin/                 # Expo config plugin
+├── ios/                    # iOS native implementation (Swift)
+├── android/                # Android native implementation (Kotlin)
+└── example/                # Example Expo app
 ```
 
 ## 🤝 Contributing
@@ -842,11 +864,11 @@ We welcome contributions! Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for gu
 
 1. **Fork the repository** on GitHub
 2. **Clone your fork**: `git clone https://github.com/YOUR_USERNAME/react-native-ble-nitro.git`
-3. **Add upstream remote**: `git remote add upstream https://github.com/zykeco/react-native-ble-nitro.git`
+3. **Add this repository as upstream**: `git remote add upstream https://github.com/EngineMon/react-native-ble-nitro.git`
 4. **Install dependencies**: `npm install`
 5. **Generate Nitro code**: `npx nitro-codegen`
 6. **Make your changes** and run tests: `npm test`
-7. **Submit a pull request**
+7. **Submit a pull request** to EngineMon/react-native-ble-nitro
 
 ## 📄 License
 
@@ -854,7 +876,7 @@ MIT License - see [LICENSE](./LICENSE) file.
 
 ## 🙏 Acknowledgments
 
-- [Zyke Band](https://zykeband.com?utm_source=github&utm_medium=readme&utm_campaign=opensource) - The fitness tracker project that inspired this library
+- [Zyke](https://zyke.co) and [Phil Schaffarzyk](https://github.com/ps73) - Authors of [react-native-ble-nitro](https://github.com/zykeco/react-native-ble-nitro), which this fork builds on, developed for [Zyke Band](https://zykeband.com?utm_source=github&utm_medium=readme&utm_campaign=opensource)
 - [Marc Rousavy](https://github.com/mrousavy) - Creator of Nitro Modules and CEO of Margelo
 - [Nitro Modules](https://nitro.margelo.com/) - High-performance native module framework
 - [Margelo](https://margelo.com/) - Nitro Modules creators
@@ -862,9 +884,8 @@ MIT License - see [LICENSE](./LICENSE) file.
 
 ## 📞 Support
 
-- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/zykeco/react-native-ble-nitro/issues)
-- 💬 **Questions**: [GitHub Discussions](https://github.com/zykeco/react-native-ble-nitro/discussions)
-- 📖 **Documentation**: [API Reference](./docs/api.md)
+- 🐛 **Bug Reports and Questions**: [GitHub Issues](https://github.com/EngineMon/react-native-ble-nitro/issues)
+- 📖 **Documentation**: this README; the native contract is documented in [`src/specs/NativeBleNitro.nitro.ts`](./src/specs/NativeBleNitro.nitro.ts)
 
 ---
 

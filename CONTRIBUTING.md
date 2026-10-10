@@ -1,6 +1,6 @@
-# Contributing to react-native-ble-nitro
+# Contributing to react-native-ble-nitro (EngineMon fork)
 
-Thank you for your interest in contributing to react-native-ble-nitro! This document provides guidelines and information for contributors.
+Thank you for your interest in contributing! This repository is EngineMon's fork of [zykeco/react-native-ble-nitro](https://github.com/zykeco/react-native-ble-nitro); contributions to the fork go to [EngineMon/react-native-ble-nitro](https://github.com/EngineMon/react-native-ble-nitro). This document provides guidelines and information for contributors.
 
 ## 📋 Table of Contents
 
@@ -14,6 +14,7 @@ Thank you for your interest in contributing to react-native-ble-nitro! This docu
 - [Submitting Changes](#submitting-changes)
 - [Nitro Development](#nitro-development)
 - [Native Development](#native-development)
+- [Syncing with zykeco upstream](#-syncing-with-zykeco-upstream)
 
 ## 🤝 Code of Conduct
 
@@ -37,14 +38,13 @@ This project follows a code of conduct to ensure a welcoming environment for all
 react-native-ble-nitro/
 ├── src/                      # TypeScript source code
 │   ├── specs/               # Nitro module specifications
-│   ├── utils/              # Utility functions
-│   └── __tests__/          # Unit tests
+│   ├── manager.ts           # BleNitroManager, BleError
+│   └── __tests__/           # Jest tests
 ├── ios/                     # iOS native implementation (Swift)
-├── android/                 # Android native implementation (Kotlin)
+├── android/                 # Android native implementation (Kotlin) and its unit tests
 ├── plugin/                  # Expo config plugin
-├── nitrogen/generated/      # Generated Nitro code (do not edit)
-├── docs/                    # Documentation
-└── examples/               # Example applications
+├── nitrogen/generated/      # Generated Nitro code (do not edit, not committed)
+└── example/                 # Example Expo app
 ```
 
 ## 🛠️ Development Setup
@@ -55,7 +55,7 @@ react-native-ble-nitro/
 # Fork the repository on GitHub first, then:
 git clone https://github.com/YOUR_USERNAME/react-native-ble-nitro.git
 cd react-native-ble-nitro
-git remote add upstream https://github.com/zykeco/react-native-ble-nitro.git
+git remote add upstream https://github.com/EngineMon/react-native-ble-nitro.git
 npm install
 ```
 
@@ -79,12 +79,6 @@ npm run build
 npm test
 ```
 
-### 5. Start Development
-
-```bash
-npm run dev
-```
-
 ## 🏗️ Architecture Overview
 
 ### Nitro Modules Foundation
@@ -104,7 +98,7 @@ This library is built on [Nitro Modules](https://nitro.margelo.com/), which prov
 ### Data Flow
 
 ```
-JavaScript/TypeScript → Compatibility Layer → Nitro Specs → Generated Native Code → Platform BLE APIs
+JavaScript/TypeScript (BleNitroManager) → Nitro Specs → Generated Native Code → Platform BLE APIs
 ```
 
 ## 🔄 Development Workflow
@@ -155,57 +149,26 @@ JavaScript/TypeScript → Compatibility Layer → Nitro Specs → Generated Nati
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run all JS tests
 npm test
 
-# Run tests with coverage
-npm run test:coverage
+# Run a specific test file
+npm test -- src/__tests__/index.test.ts
 
-# Run tests in watch mode
-npm run test:watch
-
-# Run specific test file
-npm test -- BleManager.test.ts
+# Kotlin unit tests (GattOperationQueue, BleErrors, ScanStartThrottle), through the example app's Gradle project
+cd example/android && ./gradlew :react-native-ble-nitro:testDebugUnitTest
 ```
 
 ### Test Categories
 
-1. **Unit Tests** (`src/__tests__/`): Test individual components
-2. **Integration Tests**: Test component interactions
-3. **Native Tests**: Test platform-specific functionality
+1. **JS tests** (`src/__tests__/`): `BleNitroManager` against a mocked native object
+2. **Kotlin unit tests** (`android/src/test/`): the Android operation queue, error mapping and scan throttling
+3. **On-device testing**: the example app (`example/`) against real peripherals
 
 ### Writing Tests
 
-- Use **Jest** and **@testing-library/react-native**
-- Mock Nitro modules appropriately
-- Test both success and error scenarios
-- Maintain high code coverage
-- Test compatibility layer thoroughly
-
-### Test Example
-
-```typescript
-import { BleManager } from '../index';
-import { State } from '../specs/types';
-
-describe('BleManager', () => {
-  let manager: BleManager;
-
-  beforeEach(() => {
-    manager = new BleManager();
-  });
-
-  afterEach(async () => {
-    await manager.destroy();
-  });
-
-  it('should get Bluetooth state', async () => {
-    const state = await manager.state();
-    expect(typeof state).toBe('number');
-    expect(Object.values(State)).toContain(state);
-  });
-});
-```
+- Use **Jest**; `src/__tests__/index.test.ts` shows how the native factory is mocked
+- Test both success and error scenarios, including the `BleErrorCode` of each failure
 
 ## 📏 Code Standards
 
@@ -314,17 +277,13 @@ test(manager): add connection timeout tests
 
 ### Understanding Nitro Specs
 
-Nitro specs define the interface between JavaScript and native code:
+Nitro specs define the interface between JavaScript and native code. `src/specs/NativeBleNitro.nitro.ts` is the native contract; its doc comments define threading, ordering and completion rules that both platforms and C++ consumers rely on:
 
 ```typescript
-// src/specs/BleManager.nitro.ts
-export interface BleManager extends HybridObject {
-  state(): Promise<State>;
-  startDeviceScan(
-    uuids: string[] | null,
-    options: ScanOptions | null,
-    listener: (error: NativeBleError | null, device: NativeDevice | null) => void
-  ): Promise<void>;
+// src/specs/NativeBleNitro.nitro.ts
+export interface NativeBleNitro extends HybridObject<{ ios: 'swift'; android: 'kotlin' }> {
+  readCharacteristic(deviceId: string, serviceId: string, characteristicId: string, callback: ReadCharacteristicCallback): void;
+  // ...
 }
 ```
 
@@ -346,61 +305,36 @@ npx nitro-codegen
 
 This updates:
 - `nitrogen/generated/ios/` - Swift bindings
-- `nitrogen/generated/android/` - Kotlin bindings  
+- `nitrogen/generated/android/` - Kotlin bindings
 - `nitrogen/generated/shared/` - C++ core
 
 ## 📱 Native Development
 
 ### iOS Development (Swift)
 
-- Implement protocols in `ios/`
-- Use **Core Bluetooth** framework
-- Follow **Swift conventions**
-- Handle **background modes**
-- Manage **permissions** properly
-
-### iOS Example
-
-```swift
-class BleNitroBleManager: HybridBleManagerSpec {
-    private var centralManager: CBCentralManager!
-    
-    public override init() {
-        super.init()
-        self.centralManager = CBCentralManager(delegate: self, queue: nil)
-    }
-    
-    public func state() throws -> Promise<State> {
-        return Promise.resolve(mapCBManagerState(centralManager.state))
-    }
-}
-```
+- `ios/BleNitroBleManager.swift` implements the spec; `ios/BlePeripheralDelegate.swift` holds per-peripheral state and its operation queue
+- Everything runs on the `CBCentralManager`'s dedicated serial DispatchQueue; never touch BLE state from another thread
+- Every operation completes its callback exactly once, with a result or a `BleError`
 
 ### Android Development (Kotlin)
 
-- Implement interfaces in `android/src/main/kotlin/`
-- Use **Android BLE APIs**
-- Handle **permissions** for all API levels
-- Use **coroutines** for async operations
-- Follow **Android best practices**
+- Sources are in `android/src/main/java/com/margelo/nitro/co/zyke/ble/`: `BleNitroBleManager.kt` implements the spec, `GattConnection.kt` owns one link, `GattOperationQueue.kt` serializes its GATT operations
+- Everything runs on the manager's HandlerThread, which also receives every `BluetoothGattCallback`
+- Every operation completes its callback exactly once, with a result or a `BleError`
 
-### Android Example
+## 🔀 Syncing with zykeco upstream
 
-```kotlin
-class BleNitroBleManager(private val context: ReactApplicationContext) : HybridBleManagerSpec {
-    private val bluetoothAdapter: BluetoothAdapter? by lazy {
-        (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-    }
-    
-    override fun state(): Promise<State> = Promise.resolve {
-        when {
-            bluetoothAdapter == null -> State.Unsupported
-            !bluetoothAdapter.isEnabled -> State.PoweredOff
-            else -> State.PoweredOn
-        }
-    }
-}
+Maintainers bring upstream changes into the fork by merging, never by rebasing: consumers pin commits of `main`, and a rebase would orphan them.
+
+```bash
+git remote add zykeco https://github.com/zykeco/react-native-ble-nitro.git
+git config remote.zykeco.tagOpt --no-tags   # upstream's v1.x tags stay out of the fork
+git fetch zykeco
+git checkout main
+git merge zykeco/main
 ```
+
+Keep the native identifiers (pod `BleNitro`, Kotlin package `com.margelo.nitro.co.zyke.ble`, C++ namespace) unchanged so upstream changes keep merging.
 
 ## 🔧 Troubleshooting
 
@@ -413,10 +347,8 @@ class BleNitroBleManager(private val context: ReactApplicationContext) : HybridB
 
 ### Getting Help
 
-- **GitHub Issues**: Report bugs or request features
-- **GitHub Discussions**: Ask questions or discuss ideas
+- **GitHub Issues**: [EngineMon/react-native-ble-nitro](https://github.com/EngineMon/react-native-ble-nitro/issues) for bugs, questions and feature requests
 - **Nitro Documentation**: https://nitro.margelo.com/
-- **React Native BLE**: Understanding the original API
 
 ## 📄 License
 

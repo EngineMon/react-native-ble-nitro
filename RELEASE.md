@@ -1,287 +1,50 @@
-# Release Documentation - react-native-ble-nitro
+# Releasing react-native-ble-nitro (EngineMon fork)
 
-## 🚀 Release Process
+This fork is **not published to npm**: the name `react-native-ble-nitro` on npm belongs to upstream ([zykeco/react-native-ble-nitro](https://github.com/zykeco/react-native-ble-nitro)). A release is a git tag on `main` plus a GitHub release. Consumers install a tag from GitHub (`npm install github:EngineMon/react-native-ble-nitro#vX.Y.Z`), which builds the package on install, or pin a commit as a git submodule.
 
-This document outlines the complete release process for publishing `react-native-ble-nitro` to npm.
+`main` is never rebased or force-pushed, and tags are never moved: consumers pin both.
 
 ## 📋 Pre-Release Checklist
 
 ### 1. Code Quality & Testing
-- [ ] All tests pass: `npm test`
+- [ ] All JS tests pass: `npm test`
 - [ ] Linting passes: `npm run lint`
 - [ ] TypeScript compilation successful: `npm run typecheck`
 - [ ] Nitro code generation works: `npx nitro-codegen`
-- [ ] Plugin builds successfully: `npm run build:plugin`
+- [ ] The full build works: `npm run build`
+- [ ] Kotlin unit tests pass: `cd example/android && ./gradlew :react-native-ble-nitro:testDebugUnitTest`
+- [ ] The example app works on a real iOS and Android device
 
 ### 2. Documentation Review
-- [ ] README.md is up-to-date with latest features
-- [ ] API_DIFFERENCES.md reflects current implementation
+- [ ] README.md is up-to-date, including the migration section for breaking changes
+- [ ] The doc comments in `src/specs/NativeBleNitro.nitro.ts` (the native contract) match both implementations
 - [ ] CONTRIBUTING.md has correct setup instructions
-- [ ] All code examples in docs are tested and working
 
 ### 3. Version Management
-- [ ] Update version in `package.json`
-- [ ] Update version in iOS podspec if needed
-- [ ] Create changelog entry (see [Changelog Format](#changelog-format))
-- [ ] Tag release appropriately
-
-### 4. Package Configuration
-- [ ] Verify `package.json` files array includes all necessary files
-- [ ] Check `.npmignore` excludes development files
-- [ ] Ensure peer dependencies are correct
-- [ ] Validate keywords and metadata
-
-## 🏗️ Building for Release
-
-### 1. Clean Build
-```bash
-npm run clean
-```
-
-### 2. Generate Nitro Code
-```bash
-npx nitro-codegen
-```
-
-### 3. Build Package
-```bash
-npm run build
-```
-This will:
-- Clean previous builds
-- Build the Expo plugin (`plugin/build/`)
-- Compile TypeScript (`lib/`)
-
-### 4. Verify Build Output
-Check that these directories exist and contain expected files:
-- `lib/` - Compiled TypeScript
-- `plugin/build/` - Compiled Expo plugin
-- Native code should be included as source
-
-## 📦 Package Contents
-
-The npm package will include:
-
-### **Source Files**
-- `src/` - TypeScript source code
-- `ios/` - iOS native implementation (Swift)
-- `android/` - Android native implementation (Kotlin)
-
-### **Built Files**  
-- `lib/` - Compiled JavaScript/TypeScript definitions
-- `plugin/build/` - Compiled Expo plugin
-
-### **Configuration**
-- `nitro.json` - Nitro module configuration
-- `react-native.config.js` - React Native configuration
-- `package.json` - Package metadata
-- `README.md` - Documentation
-- `LICENSE` - MIT license
-
-### **Excluded from Package**
-- `nitrogen/generated/` - Generated code (users will regenerate)
-- `src/__tests__/` - Test files
-- `node_modules/` - Dependencies
-- Development configuration files
+- [ ] Choose the bump by semver: breaking API changes bump the major version. `npm version` updates `package.json`, which the podspec reads.
 
 ## 🔄 Release Workflow
 
-### Option 1: Manual Release
 ```bash
-# 1. Ensure clean working directory
+# 1. Ensure a clean working directory on an up-to-date main
 git status
+git pull --ff-only
 
-# 2. Run full build and tests
-npm run prepublishOnly
+# 2. Run the full build and tests
+npm run build && npm test
 
-# 3. Update version (patch/minor/major)
-npm version patch  # or minor/major
+# 3. Bump the version: rebuilds, commits "X.Y.Z" and tags vX.Y.Z
+npm version minor   # or patch/major
 
-# 4. Publish to npm
-npm publish
+# 4. Push the commit and only the new tag
+git push origin main vX.Y.Z
 
-# 5. Push tags to GitHub
-git push && git push --tags
+# 5. Create the GitHub release
+gh release create vX.Y.Z --title "vX.Y.Z" --notes-file notes.md
 ```
 
-### Option 2: Automated Release Scripts
-The package includes automated scripts:
+Push the new tag by name rather than with `--tags`: a clone that fetched upstream's tags would otherwise push upstream's `v1.x` tags into the fork.
 
-```bash
-# Version bump automatically builds and pushes tags
-npm version patch
-npm publish
-```
+## 🔀 Merging upstream changes
 
-## 📝 Changelog Format
-
-Create entries in this format for each release:
-
-```markdown
-## [1.0.0] - 2025-01-XX
-
-### Added
-- Nitro Modules integration for high performance
-- iOS Swift and Android Kotlin native implementations
-- Expo config plugin with platform-specific functions
-- Comprehensive test suite
-
-### Technical Details
-- Built on Nitro Modules 0.26.4
-- Supports React Native 0.76.0+
-- Compatible with Expo SDK 52+
-- Full TypeScript definitions
-```
-
-## 🧪 Pre-Release Testing
-
-### 1. Test in Example Project
-```bash
-# Create test project
-npx create-expo-app --template blank-typescript TestBleNitro
-cd TestBleNitro
-
-# Install local package
-npm install ../react-native-ble-nitro
-
-# Add plugin to app.json
-{
-  "expo": {
-    "plugins": ["react-native-ble-nitro"]
-  }
-}
-
-# Test basic functionality
-# Add BLE usage code to App.tsx
-```
-
-### 2. Platform Testing
-- [ ] Test on iOS simulator
-- [ ] Test on iOS physical device
-- [ ] Test on Android emulator  
-- [ ] Test on Android physical device
-
-### 3. Integration Testing
-- [ ] Fresh React Native CLI project
-- [ ] Fresh Expo managed project
-- [ ] Expo bare workflow project
-
-## 🔒 Security Considerations
-
-### Before Release
-- [ ] No API keys or secrets in source code
-- [ ] No internal URLs or development endpoints
-- [ ] All dependencies are from trusted sources
-- [ ] License headers are correct
-
-### Publishing
-- [ ] Use npm two-factor authentication
-- [ ] Publish from trusted environment
-- [ ] Verify package contents after publishing
-
-## 🚦 Post-Release Steps
-
-### 1. Verify Publication
-```bash
-# Check package on npm
-npm view react-native-ble-nitro
-
-# Test installation
-npm install react-native-ble-nitro
-```
-
-### 2. Update Documentation
-- [ ] Update GitHub release notes
-- [ ] Update any external documentation
-- [ ] Announce release in relevant communities
-
-### 3. Monitor Release
-- [ ] Watch for immediate issues
-- [ ] Monitor GitHub issues
-- [ ] Check npm download stats
-
-## 🐛 Hotfix Process
-
-For critical bug fixes:
-
-1. **Create hotfix branch** from main/master
-2. **Make minimal fix** - only fix the critical issue
-3. **Test thoroughly** - ensure fix doesn't break anything
-4. **Patch version bump** - increment patch version
-5. **Fast-track release** - skip some non-critical checks if needed
-6. **Immediate publish** - get fix to users quickly
-
-```bash
-git checkout -b hotfix/critical-fix-v1.0.1
-# Make fix
-npm version patch
-npm publish
-git push && git push --tags
-```
-
-## 📊 Release Metrics
-
-Track these metrics for each release:
-- **Download counts** - npm download statistics
-- **GitHub stats** - stars, forks, issues
-- **Community feedback** - reviews, discussions
-- **Performance impact** - compared to previous versions
-
-## 🤝 Release Team
-
-### Roles & Responsibilities
-- **Maintainer**: Final approval and npm publish
-- **QA Lead**: Testing and quality assurance  
-- **Documentation**: README and docs updates
-- **Community**: Communication and support
-
-## 📞 Support After Release
-
-### Common Post-Release Tasks
-- Monitor GitHub issues for bug reports
-- Answer questions in discussions
-- Collect feedback for next release
-
-### Emergency Procedures
-If a critical issue is found after release:
-1. **Assess severity** - breaking changes vs. minor issues
-2. **Quick fix** - implement minimal viable fix
-3. **Hotfix release** - follow hotfix process above
-4. **Communication** - notify users of issue and fix
-
-## 📈 Future Release Planning
-
-### Version Strategy
-- **Patch (1.0.x)**: Bug fixes, security updates
-- **Minor (1.x.0)**: New features, non-breaking changes  
-- **Major (x.0.0)**: Breaking changes, major rewrites
-
-### Release Cadence
-- **Regular releases**: Monthly minor releases
-- **Hotfixes**: As needed for critical issues
-- **Major releases**: Quarterly or as needed
-
----
-
-## 🔗 Useful Commands
-
-```bash
-# Full release preparation
-npm run prepublishOnly
-
-# Check what will be published
-npm pack --dry-run
-
-# Publish with tag
-npm publish --tag beta
-
-# Check package info
-npm info react-native-ble-nitro
-
-# View published files
-npm view react-native-ble-nitro files
-```
-
----
-
-**Ready to release? Follow the checklist above and make React Native BLE development faster for everyone! 🚀**
+See [Syncing with zykeco upstream](./CONTRIBUTING.md#-syncing-with-zykeco-upstream). After a merge, run the full checklist above before tagging.

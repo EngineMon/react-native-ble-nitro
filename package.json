@@ -1,7 +1,7 @@
 {
   "name": "react-native-ble-nitro",
   "version": "2.0.0",
-  "description": "React Native BLE central library on Nitro Modules: operation queues, typed errors, flow-controlled writes and a C++ API",
+  "description": "EngineMon's fork of react-native-ble-nitro, a React Native BLE central library on Nitro Modules: operation queues, typed errors, flow-controlled writes and a C++ API",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "react-native": "src/index.ts",
@@ -52,8 +52,7 @@
     "lint": "eslint src/ --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build",
-    "version": "npm run build",
-    "postversion": "git push && git push --tags"
+    "version": "npm run build"
   },
   "keywords": [
     "react-native",
@@ -67,14 +66,17 @@
     "performance"
   ],
   "author": "Zyke (https://zyke.co)",
+  "contributors": [
+    "EngineMon (https://github.com/EngineMon)"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zykeco/react-native-ble-nitro.git"
+    "url": "git+https://github.com/EngineMon/react-native-ble-nitro.git"
   },
-  "homepage": "https://github.com/zykeco/react-native-ble-nitro#readme",
+  "homepage": "https://github.com/EngineMon/react-native-ble-nitro#readme",
   "bugs": {
-    "url": "https://github.com/zykeco/react-native-ble-nitro/issues"
+    "url": "https://github.com/EngineMon/react-native-ble-nitro/issues"
   },
   "engines": {
     "node": ">=20.0.0"
