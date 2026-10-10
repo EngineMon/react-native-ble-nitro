@@ -51,7 +51,7 @@
     "test": "jest",
     "lint": "eslint src/ --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
-    "prepack": "npm run build",
+    "prepare": "npm run build",
     "version": "npm run build"
   },
   "keywords": [

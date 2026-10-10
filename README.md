@@ -50,10 +50,12 @@ EngineMon's phone app streams records from its device over BLE and decodes them 
 Install from GitHub, pinned to a release tag:
 
 ```bash
-npm install react-native-nitro-modules github:EngineMon/react-native-ble-nitro#v2.0.0
+npm install --allow-git=root react-native-nitro-modules github:EngineMon/react-native-ble-nitro#v2.0.0
 ```
 
-npm builds the package on install (Nitro bindings, TypeScript and the Expo plugin). Imports and the Expo plugin keep the name `react-native-ble-nitro`.
+npm 12 refuses git dependencies unless allowed: pass `--allow-git=root`, or put `allow-git=root` in your project's `.npmrc` so later installs keep working. Older npm versions don't need it.
+
+npm builds the package on install through its `prepare` script (Nitro bindings, TypeScript and the Expo plugin), so the install must run scripts (not `--ignore-scripts`). Imports and the Expo plugin keep the name `react-native-ble-nitro`.
 
 ### Expo Setup
 
