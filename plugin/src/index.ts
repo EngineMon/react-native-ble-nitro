@@ -4,7 +4,8 @@ import withBleNitro, { withBleNitroAndroid, withBleNitroIOS, type BleNitroPlugin
 /**
  * Expo Config Plugin for react-native-ble-nitro
  * 
- * Configures iOS and Android permissions and settings for BLE operations
+ * Configures iOS and Android permissions and settings for BLE operations.
+ * Every option is documented on BleNitroPluginProps.
  * 
  * @example
  * ```json
@@ -15,9 +16,8 @@ import withBleNitro, { withBleNitroAndroid, withBleNitroIOS, type BleNitroPlugin
  *         "react-native-ble-nitro",
  *         {
  *           "isBackgroundEnabled": true,
- *           "modes": ["peripheral", "central"],
+ *           "modes": ["central"],
  *           "neverForLocation": true,
- *           "androidAdvertisingEnabled": true,
  *           "bluetoothAlwaysPermission": "Allow $(PRODUCT_NAME) to connect to bluetooth devices"
  *         }
  *       ]
