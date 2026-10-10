@@ -160,12 +160,13 @@ dependencies {
 }
 
 // The headers of the prefab module: nitrogen's shared C++ headers
-// (HybridNativeBleNitroSpec.hpp, the structs and enums), flat, so consumers
-// include them by file name.
+// (HybridNativeBleNitroSpec.hpp, the structs and enums), under BleNitro/ so
+// consumers include them as <BleNitro/HybridNativeBleNitroSpec.hpp>, the form
+// the BleNitro pod's public headers also take on iOS.
 tasks.register('prepareHeaders', Copy) {
   from fileTree('../nitrogen/generated/shared/c++').filter { it.isFile() }
   include "*.hpp"
-  into "${project.buildDir}/headers/blenitro/"
+  into "${project.buildDir}/headers/blenitro/BleNitro/"
   includeEmptyDirs = false
 }
 

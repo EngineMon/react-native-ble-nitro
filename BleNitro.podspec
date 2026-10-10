@@ -33,10 +33,8 @@ Pod::Spec.new do |s|
   # (nitrogen/generated/shared/c++: HybridNativeBleNitroSpec.hpp and the structs
   # and enums it uses) public headers of this pod, so a native module whose pod
   # depends on 'BleNitro' can include them and call the spec from C++:
-  # `#include <BleNitro/HybridNativeBleNitroSpec.hpp>` always works, and plain
-  # `#include "HybridNativeBleNitroSpec.hpp"` too when pods are static libraries
-  # and the dependent pod defines no module (CocoaPods then puts
-  # Headers/Public/BleNitro on its header search path).
+  # `#include <BleNitro/HybridNativeBleNitroSpec.hpp>`, the same path the
+  # Android prefab package publishes them under.
   load 'nitrogen/generated/ios/BleNitro+autolinking.rb'
   add_nitrogen_files(s)
 

@@ -567,7 +567,7 @@ myStream.attachBle(ble.nativeObject);
 **2. Cast it in C++.** Specs inherit `HybridObject` virtually, so it takes a `dynamic_pointer_cast` (which needs the spec's type info from `libBleNitro`, see linking below):
 
 ```cpp
-#include <HybridNativeBleNitroSpec.hpp>
+#include <BleNitro/HybridNativeBleNitroSpec.hpp>
 
 using margelo::nitro::co::zyke::ble::HybridNativeBleNitroSpec;
 

@@ -600,9 +600,13 @@ export class BleNitroManager {
         (data) => {
           if (subscription.active) onValue(data);
         },
-        callback
+        (error) => {
+          // Native keeps the previous subscription when a replacement fails,
+          // so it stays active until one succeeds.
+          if (!error) this._replaceNotificationSubscription(deviceId, service, characteristic, subscription);
+          callback(error);
+        }
       );
-      this._replaceNotificationSubscription(deviceId, service, characteristic, subscription);
     }).then(() => ({
       remove: () =>
         subscription.active
