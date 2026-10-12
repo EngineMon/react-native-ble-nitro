@@ -3,6 +3,8 @@ package com.margelo.nitro.co.zyke.ble
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.provider.Settings
+import androidx.annotation.Keep
+import com.facebook.proguard.annotations.DoNotStrip
 import com.margelo.nitro.core.ArrayBuffer
 import com.margelo.nitro.core.Promise
 
@@ -24,7 +26,12 @@ import com.margelo.nitro.core.Promise
  *   after it on the FIFO executor.
  * - Wraps every user callback exactly once through the [gate], into the type
  *   of its role; nothing below accepts anything else (see [CallbackGate]).
+ *
+ * Kept from R8: Nitro creates it by class name from C++ (BleNitroOnLoad.cpp),
+ * which R8 can't see.
  */
+@DoNotStrip
+@Keep
 class BleNitroBleManager : HybridNativeBleNitroSpec() {
     private val gate = CallbackGate()
     private val core = BleCore(gate)
