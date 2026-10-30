@@ -594,6 +594,24 @@ customBleInstance.onRestoredState((peripherals) => {
 });
 ```
 
+#### Making the central at launch
+
+iOS hands a relaunched app its restored peripherals through a central manager the app makes with the same restore identifier in `application(_:didFinishLaunchingWithOptions:)`. A `BleNitroManager` made when the JS module loads comes as late as React Native starts. To make the central on time, call the launch hook from your app delegate, with the identifier your `BleNitroManager` uses:
+
+```objc
+#import <BleNitro/BleNitroLaunch.h>
+
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
+{
+  BleNitroDidFinishLaunching(@"my-unique-identifier");
+  // ...
+}
+```
+
+- It makes the central only when Bluetooth permission is already granted (`CBManager.authorization == .allowedAlways`), so it never asks for permission. Otherwise the manager makes its own central, as without the hook. It uses the options a manager's own central gets (the restore identifier only).
+- The first manager created with that identifier runs on this central and gets its restored peripherals through `onRestoredState`, also when iOS restored them before JS ran. One manager at a time: another one made meanwhile makes its own central, and a different identifier is logged as a mistake.
+- `destroy()`, or a JS reload, ends the manager and its connections, but not the central: the next manager with the identifier runs on it again.
+
 ### TypeScript Types
 
 ```typescript

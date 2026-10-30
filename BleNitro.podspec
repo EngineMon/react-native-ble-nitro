@@ -17,10 +17,16 @@ Pod::Spec.new do |s|
     # Implementation (Swift): the CoreBluetooth glue in ios/ and the platform-independent
     # core in ios/Core, compiled into this one module.
     "ios/**/*.{swift}",
-    # Autolinking/Registration (Objective-C++)
-    "ios/**/*.{m,mm}",
+    # Autolinking/Registration (Objective-C++), and the app's launch hook
+    # (BleNitroLaunch.h, BleNitroLaunch.mm)
+    "ios/**/*.{h,m,mm}",
     # Implementation (C++ objects)
     "cpp/**/*.{hpp,cpp}",
+  ]
+  # The app's launch hook (AppDelegate includes <BleNitro/BleNitroLaunch.h>), a plain C
+  # header. add_nitrogen_files below adds nitrogen's.
+  s.public_header_files = [
+    "ios/BleNitroLaunch.h",
   ]
   # The core's unit tests (XCTest) run through the SwiftPM package (Package.swift,
   # `swift test`), never in the app: XCTest isn't linked into an app target.

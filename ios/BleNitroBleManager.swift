@@ -37,7 +37,9 @@ import UIKit
  * object. Nitro calls dispose() only when JS calls it by hand, so deinit (the last JS or
  * C++ reference went away, e.g. on a JS reload) destroys the core too: the connections
  * and the central are released and every pending completion fails with
- * BluetoothManagerDestroyed instead of never being called.
+ * BluetoothManagerDestroyed instead of never being called. A core on the process's
+ * central (SharedCentral) releases its connections only: the central stays for the
+ * manager of the next runtime.
  */
 public class BleNitroBleManager: HybridNativeBleNitroSpec {
 
@@ -46,22 +48,30 @@ public class BleNitroBleManager: HybridNativeBleNitroSpec {
     private let gate: CallbackGate
 
     /**
-     * With BLENitroLazyInit in Info.plist the central (and with it the permission prompt
-     * and state restoration) waits for the first call that needs it, or iosLazyInit().
+     * The core runs on the process's central when the app made one at launch with the
+     * same restore identifier (BleNitroLaunch.h) and no other manager holds it
+     * (SharedCentral.claim). Otherwise it makes its own; with BLENitroLazyInit in
+     * Info.plist that central (and with it the permission prompt and state restoration)
+     * waits for the first call that needs it, or iosLazyInit().
      */
     public init(restoreStateIdentifier: String? = nil, restoreStateCallback: (([BLEDevice]) -> Void)? = nil) {
-        let lazyInitEnabled = Bundle.main.object(forInfoDictionaryKey: "BLENitroLazyInit") as? Bool ?? false
-        if lazyInitEnabled && restoreStateIdentifier != nil {
-            bleLog("Warning: lazyInit is enabled with restoreStateIdentifier. State restoration will be delayed until first BLE API call.")
-        }
         let gate = CallbackGate()
         self.gate = gate
-        core = BleCore(
-            restoreIdentifier: restoreStateIdentifier,
-            restoreCallback: restoreStateCallback.map { gate.event($0) },
-            gate: gate,
-            createCentral: !lazyInitEnabled
-        )
+        let restoreCallback = restoreStateCallback.map { gate.event($0) }
+        if let shared = SharedCentral.claim(restoreIdentifier: restoreStateIdentifier) {
+            core = BleCore(shared: shared, restoreCallback: restoreCallback, gate: gate)
+        } else {
+            let lazyInitEnabled = Bundle.main.object(forInfoDictionaryKey: "BLENitroLazyInit") as? Bool ?? false
+            if lazyInitEnabled && restoreStateIdentifier != nil {
+                bleLog("Warning: lazyInit is enabled with restoreStateIdentifier. State restoration will be delayed until first BLE API call.")
+            }
+            core = BleCore(
+                restoreIdentifier: restoreStateIdentifier,
+                restoreCallback: restoreCallback,
+                gate: gate,
+                createCentral: !lazyInitEnabled
+            )
+        }
         super.init()
     }
 

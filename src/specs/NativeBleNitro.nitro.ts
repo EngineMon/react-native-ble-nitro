@@ -328,8 +328,11 @@ export interface NativeBleNitro extends HybridObject<{ ios: 'swift'; android: 'k
    * restoreStateIdentifier. It takes effect when the CBCentralManager is
    * created: right after the manager is created, or with lazy init
    * (Info.plist BLENitroLazyInit) at iosLazyInit() or the first call that
-   * needs the central; setting it after that changes nothing. Android: kept
-   * as set and otherwise unused.
+   * needs the central; setting it after that changes nothing. A manager
+   * whose identifier is the one the app made its launch central with
+   * (BleNitroLaunch.h) runs on that central instead, from creation, and
+   * destroy() leaves it to the next such manager. Android: kept as set and
+   * otherwise unused.
    */
   restoreStateIdentifier?: string;
   setRestoreStateCallback(callback: RestoreCallback): void;
