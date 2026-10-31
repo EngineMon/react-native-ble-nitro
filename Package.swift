@@ -1,7 +1,8 @@
 // swift-tools-version:5.9
 //
 // The platform-independent part of the iOS implementation (ios/Core: operation queue,
-// notification hub, callback wrappers, GATT rules) and its unit tests (ios/CoreTests),
+// notification hub, callback wrappers, GATT rules, which manager a central reports to
+// and the registry of the process's centrals) and its unit tests (ios/CoreTests),
 // as a SwiftPM package so `swift test` runs them on macOS or Linux without Xcode,
 // CocoaPods, a simulator or a device. ios/Core uses Foundation only, no CoreBluetooth
 // or Nitro, which is what makes that possible.

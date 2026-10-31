@@ -35,11 +35,11 @@ import UIKit
  *
  * Lifetime: closures made here capture the core and the caller's callbacks, never this
  * object. Nitro calls dispose() only when JS calls it by hand, so deinit (the last JS or
- * C++ reference went away, e.g. on a JS reload) destroys the core too: the connections
- * and the central are released and every pending completion fails with
- * BluetoothManagerDestroyed instead of never being called. A core on the process's
- * central (SharedCentral) releases its connections only: the central stays for the
- * manager of the next runtime.
+ * C++ reference went away, e.g. on a JS reload) destroys the core too: its connections
+ * are released and every pending completion fails with BluetoothManagerDestroyed
+ * instead of never being called. The central goes with the core, unless the manager
+ * has a restore identifier: that central is the process's, and stays for the next
+ * manager (CentralHost).
  */
 public class BleNitroBleManager: HybridNativeBleNitroSpec {
 
@@ -48,30 +48,26 @@ public class BleNitroBleManager: HybridNativeBleNitroSpec {
     private let gate: CallbackGate
 
     /**
-     * The core runs on the process's central when the app made one at launch with the
-     * same restore identifier (BleNitroLaunch.h) and no other manager holds it
-     * (SharedCentral.claim). Otherwise it makes its own; with BLENitroLazyInit in
-     * Info.plist that central (and with it the permission prompt and state restoration)
-     * waits for the first call that needs it, or iosLazyInit().
+     * The core runs on the host of `restoreStateIdentifier` (CentralHost.forManager): a
+     * central of its own without one, else the process's central for the identifier,
+     * shared with every manager made with it and superseding the one before. With
+     * BLENitroLazyInit in Info.plist a central the host doesn't have yet (and with it the
+     * permission prompt and state restoration) waits for the first call that needs it,
+     * or iosLazyInit().
      */
     public init(restoreStateIdentifier: String? = nil, restoreStateCallback: (([BLEDevice]) -> Void)? = nil) {
+        let lazyInitEnabled = Bundle.main.object(forInfoDictionaryKey: "BLENitroLazyInit") as? Bool ?? false
+        if lazyInitEnabled && restoreStateIdentifier != nil {
+            bleLog("Warning: lazyInit is enabled with restoreStateIdentifier. Unless the app made the central at launch (BleNitroLaunch.h), state restoration will be delayed until first BLE API call.")
+        }
         let gate = CallbackGate()
         self.gate = gate
-        let restoreCallback = restoreStateCallback.map { gate.event($0) }
-        if let shared = SharedCentral.claim(restoreIdentifier: restoreStateIdentifier) {
-            core = BleCore(shared: shared, restoreCallback: restoreCallback, gate: gate)
-        } else {
-            let lazyInitEnabled = Bundle.main.object(forInfoDictionaryKey: "BLENitroLazyInit") as? Bool ?? false
-            if lazyInitEnabled && restoreStateIdentifier != nil {
-                bleLog("Warning: lazyInit is enabled with restoreStateIdentifier. State restoration will be delayed until first BLE API call.")
-            }
-            core = BleCore(
-                restoreIdentifier: restoreStateIdentifier,
-                restoreCallback: restoreCallback,
-                gate: gate,
-                createCentral: !lazyInitEnabled
-            )
-        }
+        core = BleCore(
+            host: CentralHost.forManager(restoreIdentifier: restoreStateIdentifier),
+            restoreCallback: restoreStateCallback.map { gate.event($0) },
+            gate: gate,
+            createCentral: !lazyInitEnabled
+        )
         super.init()
     }
 
@@ -141,9 +137,9 @@ public class BleNitroBleManager: HybridNativeBleNitroSpec {
     // MARK: - Initialization and state restoration
 
     /**
-     * The CBCentralManager restore identifier. It takes effect when the central is created
-     * (right after init, or at the first call with lazy init); setting it later changes
-     * nothing (NativeBleNitro.nitro.ts, restoreStateIdentifier).
+     * The CBCentralManager restore identifier, fixed when the manager is created: it picks
+     * the manager's central, so setting it changes nothing (NativeBleNitro.nitro.ts,
+     * restoreStateIdentifier).
      */
     public var restoreStateIdentifier: String? {
         get { return core.restoreStateIdentifier }

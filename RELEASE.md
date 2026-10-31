@@ -55,8 +55,8 @@ See [Syncing with zykeco upstream](./CONTRIBUTING.md#-syncing-with-zykeco-upstre
 
 ### Unreleased
 
-- iOS: `BleNitroDidFinishLaunching` (`<BleNitro/BleNitroLaunch.h>`) makes the central with a restore identifier at app launch, only when Bluetooth permission is already granted. The first manager with that identifier runs on it, so state restored before JS ran still reaches `onRestoredState`, and `destroy()` or a JS reload leaves it for the next manager. See [Making the central at launch](./README.md#making-the-central-at-launch).
-- iOS: a peripheral that connects while the manager has no link to it (an attempt an earlier manager on the launch central left) is kept and reported as `Connected`, like an attempt iOS kept pending.
+- iOS: managers with the same `restoreIdentifier` share one central for the life of the process, and a manager created while another one with that identifier is alive destroys the older one first, so a JS reload works whichever comes first. `destroy()` keeps that central for the next manager; a manager without an identifier still has a central of its own. `restoreStateIdentifier` is fixed at creation. See [One central per restore identifier](./README.md#one-central-per-restore-identifier).
+- iOS: `BleNitroDidFinishLaunching()` (`<BleNitro/BleNitroLaunch.h>`) makes the central of `Info.plist`'s `BLENitroRestoreIdentifier` at app launch, only when Bluetooth permission is already granted and without the Bluetooth power alert, so state restored before JS ran still reaches the first manager's `onRestoredState`. See [Making the central at launch](./README.md#making-the-central-at-launch).
 
 ### 3.0.0
 

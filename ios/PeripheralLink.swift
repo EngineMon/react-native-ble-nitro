@@ -152,10 +152,12 @@ final class PeripheralLink: NSObject, CBPeripheralDelegate {
             /// This manager started the attempt (central.connect): its timeout cancels it.
             case issued
             /**
-             * CoreBluetooth already had an attempt pending that this manager didn't start: a
-             * connection iOS restored, or one an earlier manager left behind. It isn't this
-             * call's to cancel: its timeout fails only the call, and the attempt goes on
-             * (NativeBleNitro.nitro.ts, connect).
+             * CoreBluetooth already had an attempt pending that this call didn't start: a
+             * connection iOS restored (state restoration), or one an earlier connect took
+             * over and left pending when it timed out. A manager before this one on the
+             * same central cancelled its own at its teardown (BleCore.tearDown). It isn't
+             * this call's to cancel: its timeout fails only the call, and the attempt goes
+             * on (NativeBleNitro.nitro.ts, connect).
              */
             case takenOver
         }

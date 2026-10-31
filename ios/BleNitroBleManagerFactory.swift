@@ -4,8 +4,8 @@ import NitroModules
 /**
  * iOS Factory implementation for BLE Nitro Manager
  * Creates BleNitroBleManager instances with optional state restoration configuration.
- * A manager with the restore identifier the app made its launch central with adopts
- * that central (BleNitroBleManager.init, SharedCentral).
+ * Managers with the same restore identifier share the process's central for it, the
+ * newest superseding the one before (BleNitroBleManager.init, CentralHost).
  */
 public class BleNitroBleManagerFactory: HybridNativeBleNitroFactorySpec_base, HybridNativeBleNitroFactorySpec_protocol {
 

@@ -31,16 +31,16 @@ import NitroModules
  *
  * Lifetime: closures capture this object, never the facade, so the facade can go away
  * while work is queued. The facade's deinit and dispose() call destroy(); its posted
- * teardown keeps this object alive until it ran. The central's delegate and every link
- * hold it weakly, so nothing here forms a cycle.
+ * teardown keeps this object alive until it ran. The host (the central's delegate) and
+ * every link hold it weakly, so nothing here forms a cycle.
  *
- * The central: the core makes its own, or runs on the process's central the app made at
- * launch (SharedCentral), which the facade claimed for it. On that one it uses the
- * central's queue, attaches to its delegate (BleCentralManagerDelegate) instead of
- * making one, and at its teardown cancels only its own connections and detaches,
- * leaving the central to the next manager (a JS reload) instead of releasing it.
+ * The central: every core runs on a CentralHost, which owns the queue, the central and
+ * its delegate, and which the facade picked by restore identifier (CentralHost.swift
+ * has the two kinds and every edge case). The core attaches to it in its first task,
+ * sees the central only while attached (`central`), and releases it in its teardown. A
+ * newer core attaching to the same host supersedes this one (`supersede`).
  */
-final class BleCore: LinkOwner {
+final class BleCore: LinkOwner, HostTenant {
 
     /**
      * The ids of observer registrations posted to the queue and not applied yet.
@@ -75,35 +75,17 @@ final class BleCore: LinkOwner {
         }
     }
 
-    /// The label of a core's queue, and of SharedCentral's, which its cores run on.
-    static let queueLabel = "co.zyke.ble.nitro"
-
+    /// Owns `queue` and the central; this core is its tenant from its first task to its teardown.
+    private let host: CentralHost
+    /// The host's queue: CoreBluetooth's delegate queue, and the one queue this core's state lives on.
     private let queue: DispatchQueue
-    /**
-     * Present only on `queue`. A getter called from code already running there (a C++
-     * callback calling back in) runs inline, where `queue.sync` would deadlock. One key
-     * per queue, set by whoever made it: the core for a queue of its own, SharedCentral
-     * for the cores on its queue (a key per core would stay set on that queue after the
-     * core is gone, under the address of a freed key another object may reuse).
-     */
-    private let queueKey: DispatchSpecificKey<Bool>
 
     /// Every callback the facade handed in was wrapped through this gate; destroy() closes it.
     let gate: CallbackGate
     private let pendingRegistrations = PendingRegistrations()
 
-    private var restoreIdentifier: String?
-    private var central: CBCentralManager?
-    /// CBCentralManager.delegate is weak. Nil on the process's central, whose delegate SharedCentral keeps.
-    private var centralDelegate: BleCentralManagerDelegate?
-    /**
-     * The process's central this core runs on (SharedCentral), which the facade claimed:
-     * the core attaches to it rather than making a central, and leaves it for the next
-     * manager at its teardown. Nil: the core makes, and releases, a central of its own.
-     */
-    private let shared: SharedCentral?
-    /// The central was created with a restore identifier.
-    private var restoresState = false
+    /// The teardown ran (`tearDown`): it runs once, whether destroy() posted it or a newer core superseded this one.
+    private var tornDown = false
     private let restoration: StateRestoration
 
     private let stateObservers = ObserverSet<BLEState>()
@@ -129,7 +111,7 @@ final class BleCore: LinkOwner {
      * starts (no central is created, no connect, scan or GATT request is issued), every
      * call fails with BluetoothManagerDestroyed (`perform`), synchronous getters return
      * their empty value (`query`), and the central's delegate calls are dropped
-     * (BleCentralManagerDelegate). LinkOwner: the links ask it too, so a GATT request
+     * (CentralHost). LinkOwner: the links ask it too, so a GATT request
      * queued before destroy() never reaches the OS. Also on the queue before the teardown
      * ran: the gate is closed on destroy()'s caller thread, before the teardown is posted.
      */
@@ -138,67 +120,32 @@ final class BleCore: LinkOwner {
     }
 
     /**
-     * A core that makes its own central. `createCentral` false (BLENitroLazyInit): the
-     * central, and with it the permission prompt and state restoration, waits for the
-     * first call that needs it, or lazyInit(). `gate` is the gate the facade wrapped
+     * Attaches to `host` in its first task on the queue (CentralHost.attach): a core
+     * superseding another one on the host does so before any of its own work, and the
+     * state the host's central has already (restored peripherals, the current state)
+     * reaches it first. `createCentral` false (BLENitroLazyInit): a central the host
+     * doesn't have yet, and with it the permission prompt and state restoration, waits
+     * for the first call that needs it, or lazyInit(); a central the host has already
+     * (made at app launch) is used at once. `gate` is the gate the facade wrapped
      * `restoreCallback` (and every later callback) through.
      */
-    convenience init(restoreIdentifier: String?, restoreCallback: Once<[BLEDevice]>?, gate: CallbackGate, createCentral: Bool) {
-        let queue = DispatchQueue(label: BleCore.queueLabel)
-        let queueKey = DispatchSpecificKey<Bool>()
-        queue.setSpecific(key: queueKey, value: true)
-        self.init(
-            queue: queue,
-            queueKey: queueKey,
-            shared: nil,
-            restoreIdentifier: restoreIdentifier,
-            restoreCallback: restoreCallback,
-            gate: gate
-        )
-        if createCentral {
-            queue.async { [self] in _ = ensureCentral() }
-        }
-    }
-
-    /**
-     * A core on the process's central (SharedCentral), which the facade claimed. It
-     * attaches at once, in its first task on the queue: the central exists already, so
-     * lazy init has nothing to put off, and the state restored at launch reaches
-     * `restoreCallback` as early as it can. Being this core's first task, the calls the
-     * attach replays (BleCentralManagerDelegate.attach) run with nothing of it in flight.
-     */
-    convenience init(shared: SharedCentral, restoreCallback: Once<[BLEDevice]>?, gate: CallbackGate) {
-        self.init(
-            queue: shared.queue,
-            queueKey: shared.queueKey,
-            shared: shared,
-            restoreIdentifier: shared.restoreIdentifier,
-            restoreCallback: restoreCallback,
-            gate: gate
-        )
-        queue.async { [self] in _ = ensureCentral() }
-    }
-
-    private init(
-        queue: DispatchQueue,
-        queueKey: DispatchSpecificKey<Bool>,
-        shared: SharedCentral?,
-        restoreIdentifier: String?,
-        restoreCallback: Once<[BLEDevice]>?,
-        gate: CallbackGate
-    ) {
-        self.queue = queue
-        self.queueKey = queueKey
-        self.shared = shared
-        self.restoreIdentifier = restoreIdentifier
+    init(host: CentralHost, restoreCallback: Once<[BLEDevice]>?, gate: CallbackGate, createCentral: Bool) {
+        self.host = host
+        self.queue = host.queue
         self.restoration = StateRestoration(callback: restoreCallback)
         self.gate = gate
+        queue.async { [self] in
+            host.attach(self)
+            if createCentral {
+                _ = ensureCentral()
+            }
+        }
     }
 
     // MARK: - The queue
 
     private var isOnQueue: Bool {
-        return DispatchQueue.getSpecific(key: queueKey) != nil
+        return host.isOnQueue
     }
 
     /// Runs `work` on the queue and returns its result.
@@ -287,34 +234,28 @@ final class BleCore: LinkOwner {
     // MARK: - The central
 
     /**
-     * The central, created (or, on the process's central, attached to) on first use. Nil
-     * once destroy() was called: no central is created or attached to, and none is handed
-     * out.
+     * The host's central while this core is attached to the host (from its first task to
+     * its teardown); nil before the host made one. A superseded core never sees the
+     * central its successor uses.
+     */
+    private var central: CBCentralManager? {
+        return host.attachedCentral(of: self)
+    }
+
+    /// The central has a restore identifier: its first state update with nothing restored reports an empty restoration (StateRestoration).
+    private var restoresState: Bool {
+        return host.restoreIdentifier != nil
+    }
+
+    /**
+     * The central, made by the host on first need (CentralHost.ensureCentral). Nil once
+     * destroy() was called (no central is made, and none is handed out), and for a core
+     * not attached: only a synchronous getter running inline on the queue (a C++ callback
+     * of another core on the same host) can ask before this core's first task did.
      */
     private func ensureCentral() -> CBCentralManager? {
-        guard !isDestroying else { return nil }
-        if let central {
-            return central
-        }
-        if let shared {
-            // State first: the attach gives this core its start, the restored state and
-            // the current one (BleCentralManagerDelegate.attach), and the empty restoration
-            // report reads restoresState. The central was made with its restore identifier.
-            central = shared.central
-            restoresState = true
-            shared.delegate.attach(self, central: shared.central)
-            return shared.central
-        }
-        var options: [String: Any] = [:]
-        if let identifier = restoreIdentifier {
-            options[CBCentralManagerOptionRestoreIdentifierKey] = identifier
-        }
-        let delegate = BleCentralManagerDelegate(core: self)
-        let central = CBCentralManager(delegate: delegate, queue: queue, options: options.isEmpty ? nil : options)
-        self.centralDelegate = delegate
-        self.central = central
-        self.restoresState = restoreIdentifier != nil
-        return central
+        guard !isDestroying, host.isAttached(self) else { return nil }
+        return host.ensureCentral()
     }
 
     /// LinkOwner: the central a link may start or cancel a connection through; nil once destroy() was called.
@@ -350,22 +291,20 @@ final class BleCore: LinkOwner {
     // MARK: - Lazy init, restoration, state
 
     /**
-     * The CBCentralManager restore identifier. It takes effect when the central is created
-     * (right after init, or at the first call with lazy init); setting it later changes
-     * nothing, which is logged (NativeBleNitro.nitro.ts, restoreStateIdentifier).
+     * The restore identifier the facade picked the host by (NativeBleNitro.nitro.ts,
+     * restoreStateIdentifier). Fixed at creation: it chose the host, whose central has
+     * it, so setting another one changes nothing, which is logged.
      */
     var restoreStateIdentifier: String? {
-        get { return sync { restoreIdentifier } }
+        get { return host.restoreIdentifier }
         set {
-            sync {
-                if central != nil && newValue != restoreIdentifier {
-                    bleLog("restoreStateIdentifier was set after the central was created; it takes effect only for a new manager")
-                }
-                restoreIdentifier = newValue
+            if newValue != host.restoreIdentifier {
+                bleLog("restoreStateIdentifier is fixed when the manager is created; setting it changes nothing (create a manager with the identifier instead)")
             }
         }
     }
 
+    /// Makes the central the host doesn't have yet; nothing to do on a host whose central exists (made at app launch, or by an earlier manager).
     func lazyInit() {
         queue.async { [self] in _ = ensureCentral() }
     }
@@ -742,36 +681,52 @@ final class BleCore: LinkOwner {
         let closedNow = gate.close()
         if isOnQueue {
             if closedNow {
-                postTearDown()
+                queue.async { [self] in tearDown() }
             }
             return
         }
         let barrier = DispatchSemaphore(value: 0)
         queue.async { barrier.signal() }
         if closedNow {
-            postTearDown()
+            queue.async { [self] in tearDown() }
         }
         barrier.wait()
     }
 
     /**
-     * Posts the teardown, then, on the process's central, lets the next manager claim it
-     * (SharedCentral.release). In that order: a core that claims it posts every task to
-     * the same serial queue, so they all run after this teardown and never meet this
-     * core's links (whose peripherals it may use too).
+     * HostTenant: a newer manager attached to this core's host (CentralHost.attach, in
+     * that manager's first task, on the queue). This core ends now, inline, as destroy()
+     * would end it: the gate closes (none of its callbacks reaches its caller any more,
+     * typically a JS runtime a reload is tearing down) and the teardown runs, before
+     * anything of the newer core, so it never stops the newer core's scan or clears the
+     * delegate of a peripheral the newer core took on. Also when destroy() was called
+     * already and its posted teardown hasn't run yet: that one then finds nothing to do
+     * (`tornDown`). Its facade's later dispose() or deinit closes no gate and posts no
+     * teardown (destroy()); it only waits behind the running task.
+     *
+     * Two managers alive with one restore identifier can't share its central, and the
+     * newest is the one the app uses after a JS reload (whose old manager goes away
+     * before or after the new one is made, in no fixed order), so the newest wins. Outside
+     * a reload that is an app mistake, which the older manager's callers see as
+     * BluetoothManagerDestroyed; the log names it either way.
      */
-    private func postTearDown() {
-        queue.async { [self] in tearDown() }
-        shared?.release()
+    func supersede() {
+        bleLog("A new manager with restore identifier \(host.restoreIdentifier ?? "") took over its central: the previous one is destroyed (expected after a JS reload, else two managers share an identifier)")
+        gate.close()
+        tearDown()
     }
 
     /**
-     * First the OS resources: the central's delegate is cleared (no more central calls),
-     * the scan stops, every connection is cancelled and the central is released, so a new
-     * manager created right after (a JS reload) can take the same restore identifier. On
-     * the process's central the core detaches instead (its delegate keeps what the next
-     * core needs) and cancels only its own links' connections: the central stays for the
-     * next manager.
+     * Runs once (`tornDown`): posted by destroy(), or inline at `supersede`, whichever
+     * comes first.
+     *
+     * First the OS resources, while this core is still attached and sees the central: the
+     * core releases its host (CentralHost.release: no more central calls reach it; a
+     * private host also clears the central's delegate and releases the central, so a
+     * manager made right after can take the same restore identifier), the scan stops and
+     * every connection of this core's links is cancelled. On a process host only this
+     * core's: the central stays for the next manager. A core destroyed before its first
+     * task never attached and has nothing of the central to end.
      * Then, after every state change (collect, then fire): every link closes
      * (PeripheralLink.closeAll), failing its pending connect, operations, subscription
      * completions and disconnect() calls with BluetoothManagerDestroyed, and the calls
@@ -780,12 +735,11 @@ final class BleCore: LinkOwner {
      * destroy() was called, and so is the running scan. Last, the observers go.
      */
     private func tearDown() {
+        guard !tornDown else { return }
+        tornDown = true
+        let central = self.central
+        host.release(self)
         if let central {
-            if let shared {
-                shared.delegate.detach(self)
-            } else {
-                central.delegate = nil
-            }
             _ = scanner.stop(on: central)
             // CoreBluetooth only accepts the call while powered on (it logs API misuse
             // otherwise); below that, the links are already down.
@@ -795,8 +749,6 @@ final class BleCore: LinkOwner {
                 }
             }
         }
-        central = nil
-        centralDelegate = nil
         waitingScanStart = nil
         let waiting = waiters.takeAll()
         restoration.discard()
@@ -808,7 +760,7 @@ final class BleCore: LinkOwner {
         connectionObservers.clear()
     }
 
-    // MARK: - CBCentralManagerDelegate (on the queue, only while not destroying: BleCentralManagerDelegate)
+    // MARK: - CBCentralManagerDelegate (on the queue, only while attached and not destroying: CentralHost)
 
     /**
      * When Bluetooth leaves the powered-on state, every link and the scan end
@@ -916,15 +868,18 @@ final class BleCore: LinkOwner {
     }
 
     /**
-     * A peripheral without a link here connects only on the process's central
-     * (SharedCentral): an attempt the core before this one left, whose cancel at that
-     * core's teardown lost the race. It gets a link and is kept like any attempt the
-     * system kept pending (PeripheralLink.didConnect): Connected tells the app, which
-     * adopts or drops it, instead of the peripheral staying connected with no owner,
-     * which would hide it from every scan.
+     * Only a peripheral with a link here can connect: every connect is a link's
+     * (connect() makes the link first), restored peripherals get theirs when the
+     * restoration reaches this core, and a superseded or destroyed core cancelled every
+     * attempt of its links, which CoreBluetooth then reports through
+     * didDisconnectPeripheral (cancelPeripheralConnection's documentation). So a
+     * didConnect without a link here is such a cancelled attempt that won the race against
+     * its cancel, already on its way down, and is ignored: a link for it would only
+     * announce a Connected and a Disconnected nobody asked for. The same on both host
+     * kinds.
      */
     func centralDidConnect(_ peripheral: CBPeripheral) {
-        link(for: peripheral).didConnect()
+        links[peripheral.identifier.uuidString]?.didConnect()
     }
 
     func centralDidFailToConnect(_ peripheral: CBPeripheral, error: Error?) {

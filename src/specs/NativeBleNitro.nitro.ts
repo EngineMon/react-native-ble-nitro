@@ -324,15 +324,17 @@ export interface NativeBleNitro extends HybridObject<{ ios: 'swift'; android: 'k
   // iOS only. Android ignores these: it has no state restoration.
   /**
    * iOS: the CoreBluetooth state restoration identifier
-   * (CBCentralManagerOptionRestoreIdentifierKey), from the factory's
-   * restoreStateIdentifier. It takes effect when the CBCentralManager is
-   * created: right after the manager is created, or with lazy init
+   * (CBCentralManagerOptionRestoreIdentifierKey), the factory's
+   * restoreStateIdentifier. Fixed when the manager is created: setting it
+   * changes nothing (logged). A manager without one has a CBCentralManager
+   * of its own, made right after the manager is created, or with lazy init
    * (Info.plist BLENitroLazyInit) at iosLazyInit() or the first call that
-   * needs the central; setting it after that changes nothing. A manager
-   * whose identifier is the one the app made its launch central with
-   * (BleNitroLaunch.h) runs on that central instead, from creation, and
-   * destroy() leaves it to the next such manager. Android: kept as set and
-   * otherwise unused.
+   * needs it, and released by destroy(). Managers with one share the
+   * process's CBCentralManager for it, made at app launch (Info.plist
+   * BLENitroRestoreIdentifier and BleNitroLaunch.h) or else like a
+   * manager's own, and kept by destroy() for the next manager; a manager
+   * created while another one with the identifier is alive (a JS reload)
+   * destroys that one first. Android: kept as set and otherwise unused.
    */
   restoreStateIdentifier?: string;
   setRestoreStateCallback(callback: RestoreCallback): void;

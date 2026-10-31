@@ -594,23 +594,33 @@ customBleInstance.onRestoredState((peripherals) => {
 });
 ```
 
+#### One central per restore identifier
+
+CoreBluetooth hands restored state to one central per restore identifier, so on iOS every manager created with the same `restoreIdentifier` runs on one central, kept for the life of the app process. One manager uses it at a time: creating a manager while another one with that identifier is alive destroys the older one first (its pending calls fail with `BluetoothManagerDestroyed`, its connections and scan end, its callbacks go silent). That is what a JS reload needs, whether the old manager goes away before or after the new one is created; outside a reload it is a mistake, and it is logged either way. `destroy()` ends the manager and its connections but keeps the central for the next manager, which starts from its current state. A manager without a `restoreIdentifier` has a central of its own, which `destroy()` releases. The identifier is fixed when the manager is created.
+
 #### Making the central at launch
 
-iOS hands a relaunched app its restored peripherals through a central manager the app makes with the same restore identifier in `application(_:didFinishLaunchingWithOptions:)`. A `BleNitroManager` made when the JS module loads comes as late as React Native starts. To make the central on time, call the launch hook from your app delegate, with the identifier your `BleNitroManager` uses:
+iOS hands a relaunched app its restored peripherals through a central manager the app makes with the same restore identifier in `application(_:didFinishLaunchingWithOptions:)`. A `BleNitroManager` made when the JS module loads comes as late as React Native starts. To make the central on time, put the identifier in `Info.plist` and call the launch hook from your app delegate:
+
+```xml
+<key>BLENitroRestoreIdentifier</key>
+<string>my-unique-identifier</string>
+```
 
 ```objc
 #import <BleNitro/BleNitroLaunch.h>
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 {
-  BleNitroDidFinishLaunching(@"my-unique-identifier");
+  BleNitroDidFinishLaunching();
   // ...
 }
 ```
 
-- It makes the central only when Bluetooth permission is already granted (`CBManager.authorization == .allowedAlways`), so it never asks for permission. Otherwise the manager makes its own central, as without the hook. It uses the options a manager's own central gets (the restore identifier only).
-- The first manager created with that identifier runs on this central and gets its restored peripherals through `onRestoredState`, also when iOS restored them before JS ran. One manager at a time: another one made meanwhile makes its own central, and a different identifier is logged as a mistake.
-- `destroy()`, or a JS reload, ends the manager and its connections, but not the central: the next manager with the identifier runs on it again.
+- It makes the central only when Bluetooth permission is already granted (`CBManager.authorization == .allowedAlways`), so it never asks for permission. Otherwise the first manager with the identifier makes it when it needs it, as without the hook (lazy init applies).
+- The central it makes never shows the system alert asking to turn Bluetooth on (`CBCentralManagerOptionShowPowerAlertKey` false): a launch may be a background one for something else. A central a manager makes keeps CoreBluetooth's default.
+- Every manager created with the `Info.plist` identifier runs on this central, and the first one gets the restored peripherals through `onRestoredState`, also when iOS restored them before JS ran. A manager created with another identifier is an app mistake: debug builds stop on an assertion, release builds log it, and that manager runs on a central of its own identifier.
+- Calling it again, or from another thread, does nothing more. Without the `Info.plist` key it makes nothing, with the same assertion and log.
 
 ### TypeScript Types
 
@@ -1006,6 +1016,8 @@ With iOS Lazy initialization, BLE will be automatically initialized on the first
 ```typescript
 bleNitro.iosLazyInit();
 ```
+
+A central the app made at launch ([Making the central at launch](#making-the-central-at-launch)) exists already, and only with permission granted, so a manager with its restore identifier has nothing to wait for and gets the restored peripherals right away.
 
 ### iOS Background Modes
 
